@@ -201,18 +201,27 @@ func (s *Service) SetCustomerPolicyReader(r CustomerPolicyReader) {
 //     policy by id.
 //  2. Otherwise, the tenant's is_default=true policy.
 //
-// Lookup failures on step 1 (e.g. the assigned policy was deleted
-// underneath the customer's pointer; the FK ON DELETE SET NULL safety
-// net should prevent this but defensive coding) fall through to the
-// default — a missing-policy customer continues to dun rather than
-// erroring out at run time.
+// Only a policy that is genuinely not set falls through to the default: no
+// dunning_policy_id, or an assigned policy that no longer exists (the FK's
+// ON DELETE SET NULL should prevent that). A read ERROR fails instead — the
+// run stores its policy for life, so defaulting on a blip would bind the
+// customer's run to the wrong retry schedule, attempt cap and terminal
+// actions for good.
 func (s *Service) GetEffectivePolicyForCustomer(ctx context.Context, tenantID, customerID string) (domain.DunningPolicy, error) {
 	if s.custPolicy != nil && customerID != "" {
-		if pid, err := s.custPolicy.GetDunningPolicyID(ctx, tenantID, customerID); err == nil && pid != "" {
-			if p, err := s.store.GetPolicyByID(ctx, tenantID, pid); err == nil {
+		pid, err := s.custPolicy.GetDunningPolicyID(ctx, tenantID, customerID)
+		if err != nil && !errors.Is(err, errs.ErrNotFound) {
+			return domain.DunningPolicy{}, fmt.Errorf("read the customer's dunning policy: %w", err)
+		}
+		if pid != "" {
+			p, err := s.store.GetPolicyByID(ctx, tenantID, pid)
+			if err == nil {
 				return p, nil
 			}
-			// Assigned policy not found — fall through to default.
+			if !errors.Is(err, errs.ErrNotFound) {
+				return domain.DunningPolicy{}, fmt.Errorf("load dunning policy %s: %w", pid, err)
+			}
+			// Assigned policy no longer exists — fall through to default.
 		}
 	}
 	return s.store.GetDefaultPolicy(ctx, tenantID)
@@ -924,26 +933,36 @@ func (s *Service) exhaustRun(ctx context.Context, tenantID string, run domain.In
 	// mid-tick would otherwise cancel a paying customer's subscription here. Re-
 	// read invoice status as late as possible and, if it is now terminal, resolve
 	// the run (CAS-safe) instead of firing the terminal action. Same STATUS gate
-	// as the tick-start check; on a fetch error fall through (a DB blip must not
-	// strand an exhausted run — the guarded writes below still protect a resolve
-	// that lands during the action itself).
+	// as the tick-start check. This one read also feeds both terminal actions
+	// below, so the state they act on is the state this check just cleared.
+	// A fetch ERROR means the state is unknown: neither action fires, and the
+	// run is re-queued through the action-failed path (the old behaviour fell
+	// through, and a second read that succeeded acted without this check).
+	var inv domain.Invoice
+	invRead, invReadFailed := false, false
 	if s.invoiceGet != nil {
-		if inv, err := s.invoiceGet.Get(ctx, tenantID, run.InvoiceID); err == nil {
+		loaded, err := s.invoiceGet.Get(ctx, tenantID, run.InvoiceID)
+		if err != nil {
+			invReadFailed = true
+			slog.Warn("failed to load invoice for dunning terminal action",
+				"invoice_id", run.InvoiceID, "error", err)
+		} else {
 			switch {
-			case inv.Status == domain.InvoicePaid || inv.PaymentStatus == domain.PaymentSucceeded:
+			case loaded.Status == domain.InvoicePaid || loaded.PaymentStatus == domain.PaymentSucceeded:
 				_, rerr := s.resolveListedRun(ctx, tenantID, run, domain.ResolutionPaymentRecovered, "payment_recovered", nil)
 				return rerr
 			// The resolution names WHICH terminal state closed the run. The
 			// event reason below already derived it from inv.Status; before
 			// the 0170 split the resolution column threw that away and wrote
 			// one value for both outcomes.
-			case inv.Status == domain.InvoiceVoided:
-				_, rerr := s.resolveListedRun(ctx, tenantID, run, domain.ResolutionInvoiceVoided, "invoice_"+string(inv.Status), nil)
+			case loaded.Status == domain.InvoiceVoided:
+				_, rerr := s.resolveListedRun(ctx, tenantID, run, domain.ResolutionInvoiceVoided, "invoice_"+string(loaded.Status), nil)
 				return rerr
-			case inv.Status == domain.InvoiceUncollectible:
-				_, rerr := s.resolveListedRun(ctx, tenantID, run, domain.ResolutionInvoiceNotCollectible, "invoice_"+string(inv.Status), nil)
+			case loaded.Status == domain.InvoiceUncollectible:
+				_, rerr := s.resolveListedRun(ctx, tenantID, run, domain.ResolutionInvoiceNotCollectible, "invoice_"+string(loaded.Status), nil)
 				return rerr
 			}
+			inv, invRead = loaded, true
 		}
 	}
 
@@ -960,7 +979,15 @@ func (s *Service) exhaustRun(ctx context.Context, tenantID string, run domain.In
 	// "escalated" beside an invoice/sub that never got closed — escalated
 	// runs are permanently excluded from both due-run pickers, so they'd
 	// never be re-attempted.
-	actionFailed := false
+	// Unknown invoice state: neither half fires. A policy with no terminal
+	// actions has nothing to protect, but the read error still means the run
+	// may already be paid, so the tick fails and the run is re-checked on the
+	// next one — rather than escalating, or being labelled action_failed for
+	// an action that does not exist.
+	if invReadFailed && policy.FinalSubscriptionAction == domain.SubActionNone && policy.FinalInvoiceAction == domain.InvActionNone {
+		return fmt.Errorf("dunning exhaust: read invoice %s for the paid re-check", run.InvoiceID)
+	}
+	actionFailed := invReadFailed
 
 	// applied is what the escalation email renders. It records whether each
 	// REQUESTED END STATE HOLDS — not whether this call performed the
@@ -986,20 +1013,6 @@ func (s *Service) exhaustRun(ctx context.Context, tenantID string, run domain.In
 	// a known-degraded construction, failure means the state is unknown, and
 	// acting blind there could email a lie. So a failure blocks both halves
 	// and re-queues; absence blocks only the subscription half.
-	var inv domain.Invoice
-	invRead := false
-	needsInvoice := policy.FinalSubscriptionAction != domain.SubActionNone ||
-		policy.FinalInvoiceAction != domain.InvActionNone
-	if needsInvoice && s.invoiceGet != nil {
-		loaded, err := s.invoiceGet.Get(ctx, tenantID, run.InvoiceID)
-		if err != nil {
-			actionFailed = true
-			slog.Warn("failed to load invoice for dunning terminal action",
-				"invoice_id", run.InvoiceID, "error", err)
-		} else {
-			inv, invRead = loaded, true
-		}
-	}
 
 	// SUBSCRIPTION first: it is the half that stops future money movement,
 	// and it matches Stripe's causality (there the subscription setting is
@@ -1265,40 +1278,53 @@ func (s *Service) applyInvoiceAction(ctx context.Context, tenantID, invoiceID st
 // feedback_audit_overlapping_flows: same operator intent ("we're not
 // collecting"), same end state required.
 //
-// The invoice-side write is best-effort and logged on failure rather
-// than rolled back — the run's resolved state is itself useful for the
-// dunning history view, and a wrapper transaction across two domains
-// is heavier than the rarity warrants. If MarkUncollectible 4xxs
-// (e.g. invoice was already paid via webhook between dialog open and
-// submit), we surface the error to the caller and the operator can
-// reconcile.
+// The invoice write-off runs first; if it fails (e.g. the invoice was paid
+// via webhook between dialog open and submit) the error is returned and the
+// run stays open. If the run update then fails, a retry finds the invoice
+// already written off and only resolves the run.
 func (s *Service) ResolveRun(ctx context.Context, tenantID, runID string, resolution domain.DunningResolution) (domain.InvoiceDunningRun, error) {
 	run, err := s.store.GetRun(ctx, tenantID, runID)
 	if err != nil {
 		return domain.InvoiceDunningRun{}, err
 	}
 
-	// Resolve via the shared CAS path so an operator resolve racing an automated
-	// resolver (a card settle or the scheduler) fires dunning.resolved exactly once —
-	// the CAS winner owns the timeline row + the outbound webhook.
-	updated, err := s.resolveRunNow(ctx, tenantID, run, resolution, string(resolution))
-	if err != nil {
-		return domain.InvoiceDunningRun{}, err
-	}
-
-	if resolution == domain.ResolutionInvoiceNotCollectible && s.invoiceUncollect != nil {
-		if err := s.invoiceUncollect.MarkUncollectible(ctx, tenantID, run.InvoiceID); err != nil {
-			// Already-uncollectible is benign (race with automated
-			// terminal invoice action). Surface other errors so the operator
-			// knows the dunning run was resolved but the invoice
-			// didn't transition.
-			if !errors.Is(err, errs.ErrInvalidState) {
-				return updated, fmt.Errorf("mark invoice uncollectible: %w", err)
+	// The write-off runs BEFORE the run is resolved, like the operator's
+	// recovered/voided actions: resolving first and then failing the write-off
+	// left a resolved run beside an invoice still open, which nothing revisits.
+	// An invoice already written off (a race with the automated terminal
+	// action) is the requested end state, so it proceeds to resolve.
+	if resolution == domain.ResolutionInvoiceNotCollectible && s.invoiceUncollect != nil && run.InvoiceID != "" {
+		done, err := s.invoiceIn(ctx, tenantID, run.InvoiceID, domain.InvoiceUncollectible)
+		if err != nil {
+			return domain.InvoiceDunningRun{}, err
+		}
+		if !done {
+			if err := s.invoiceUncollect.MarkUncollectible(ctx, tenantID, run.InvoiceID); err != nil {
+				return domain.InvoiceDunningRun{}, fmt.Errorf("mark invoice uncollectible: %w", err)
 			}
 		}
 	}
 
-	return updated, nil
+	// Resolve via the shared CAS path so an operator resolve racing an automated
+	// resolver (a card settle or the scheduler) fires dunning.resolved exactly once —
+	// the CAS winner owns the timeline row + the outbound webhook.
+	return s.resolveRunNow(ctx, tenantID, run, resolution, string(resolution))
+}
+
+// invoiceIn reports whether the invoice is already in status want — an
+// operator resolution whose invoice side already happened (a retry after the
+// run update failed, or a race with a webhook or the automated action) is
+// done, not an error. Without an invoice reader wired it reports false and
+// the writer's own state check decides.
+func (s *Service) invoiceIn(ctx context.Context, tenantID, invoiceID string, want domain.InvoiceStatus) (bool, error) {
+	if s.invoiceGet == nil {
+		return false, nil
+	}
+	inv, err := s.invoiceGet.Get(ctx, tenantID, invoiceID)
+	if err != nil {
+		return false, fmt.Errorf("read invoice %s: %w", invoiceID, err)
+	}
+	return inv.Status == want, nil
 }
 
 // resolveRunNow transitions an already-loaded run to resolved with the given
@@ -1379,8 +1405,13 @@ func (s *Service) resolveRunAt(ctx context.Context, tenantID string, run domain.
 // Called when an invoice is voided or paid outside of dunning.
 func (s *Service) ResolveByInvoice(ctx context.Context, tenantID, invoiceID string, resolution domain.DunningResolution) error {
 	run, err := s.store.GetActiveRunByInvoice(ctx, tenantID, invoiceID)
-	if err != nil {
+	if errors.Is(err, errs.ErrNotFound) {
 		return nil // No active run — nothing to resolve
+	}
+	if err != nil {
+		// A read error is not "no run": swallowing it left the run active
+		// beside a paid or voided invoice while the caller saw success.
+		return fmt.Errorf("look up the invoice's active dunning run: %w", err)
 	}
 	_, rerr := s.resolveRunNow(ctx, tenantID, run, resolution, fmt.Sprintf("invoice %s", string(resolution)))
 	return rerr
