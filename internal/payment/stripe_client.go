@@ -428,3 +428,24 @@ func (c *LiveStripeClient) SearchPaymentIntentsByInvoiceID(ctx context.Context, 
 	}
 	return out, nil
 }
+
+// GetCheckoutSession reads a hosted Checkout Session's outcome (the hosted
+// sweep, reconciler_hosted.go).
+func (c *LiveStripeClient) GetCheckoutSession(ctx context.Context, sessionID string) (CheckoutSessionResult, error) {
+	sc := c.clients.ForCtx(ctx)
+	if sc == nil {
+		return CheckoutSessionResult{}, ErrStripeNotConfigured
+	}
+	sess, err := sc.V1CheckoutSessions.Retrieve(ctx, sessionID, nil)
+	if err != nil {
+		return CheckoutSessionResult{}, classifyStripeError(err)
+	}
+	out := CheckoutSessionResult{
+		Status:        string(sess.Status),
+		PaymentStatus: string(sess.PaymentStatus),
+	}
+	if sess.PaymentIntent != nil {
+		out.PaymentIntentID = sess.PaymentIntent.ID
+	}
+	return out, nil
+}
