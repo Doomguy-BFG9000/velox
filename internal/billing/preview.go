@@ -2,7 +2,6 @@ package billing
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,7 +9,6 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/sagarsuperuser/velox/internal/domain"
-	"github.com/sagarsuperuser/velox/internal/errs"
 )
 
 // PreviewLine is one line of an invoice preview. Mirrors the line shape the
@@ -197,10 +195,10 @@ func (e *Engine) previewWithWindow(ctx context.Context, sub domain.Subscription,
 	// matches what its actual invoice will be.
 	//
 	// A previewMeter ERROR aborts the whole preview (ADR-070,
-	// no-silent-fallbacks). Config-shaped soft cases (no rule binding,
-	// rule not found, rating failure) already surface as warnings from
-	// INSIDE previewMeter; what reaches this err is infrastructure
-	// failure (store errors, transient resolution failures), and a
+	// no-silent-fallbacks). Only a meter with no rule binding at all and a
+	// net-negative bucket (usage corrections) are soft cases, surfaced as
+	// warnings from INSIDE previewMeter. A missing pinned rule, a rating
+	// failure and store or resolution errors all reach this err, and a
 	// partial preview built from those is a lie — worse, the threshold
 	// scan PERSISTS these lines as a fire invoice, and a silently
 	// dropped meter's pre-fire usage would then be billed by nobody:
@@ -306,6 +304,16 @@ func (e *Engine) previewMeter(ctx context.Context, tenantID, customerID, meterID
 		if agg.Quantity.IsZero() {
 			continue
 		}
+		// Ingest accepts negative corrections, so a bucket's period-to-date
+		// total can be negative until new usage overtakes it. That is a
+		// legitimate state, not a pricing error: it contributes nothing to
+		// a preview or a threshold, with a warning. (Pricing it would fail —
+		// ComputeAmountCents refuses negative quantities — and abort the
+		// whole threshold evaluation for the subscription.)
+		if agg.Quantity.IsNegative() {
+			warnings = append(warnings, fmt.Sprintf("meter %q: net-negative usage so far (%s) after corrections — counted as 0", meter.Key, agg.Quantity.String()))
+			continue
+		}
 
 		ratingRuleID := agg.RatingRuleVersionID
 		if ratingRuleID == "" {
@@ -323,22 +331,19 @@ func (e *Engine) previewMeter(ctx context.Context, tenantID, customerID, meterID
 		// scan, which persists these lines as a real invoice). This is
 		// what makes preview == invoice hold across a mid-period
 		// publish, and a threshold fire agree with the later close.
+		// Both failures abort, as the cycle close does for the same rule: a
+		// threshold fire persists these lines as a real invoice, and a
+		// skipped line under-billed the fire (the bucket was then not on
+		// the watermark either). A missing PINNED version is not "not set" —
+		// usage is bound to it — so it fails like any other error.
 		ratingRule, err := e.resolveRatedRule(ctx, tenantID, customerID, ratingRuleID, from)
 		if err != nil {
-			if errors.Is(err, errs.ErrNotFound) {
-				warnings = append(warnings, fmt.Sprintf("meter %q rule %q: rating rule not found", meter.Key, ratingRuleID))
-				continue
-			}
-			// Transient failure: abort rather than degrade — a
-			// threshold fire built from this preview would silently
-			// misprice (e.g. list price for a negotiated customer).
 			return nil, nil, fmt.Errorf("resolve pricing for meter %q rule %q: %w", meter.Key, ratingRuleID, err)
 		}
 
 		amount, err := domain.ComputeAmountCents(ratingRule, agg.Quantity)
 		if err != nil {
-			warnings = append(warnings, fmt.Sprintf("meter %q rule %q: rating failed: %s", meter.Key, ratingRule.RuleKey, err.Error()))
-			continue
+			return nil, nil, fmt.Errorf("compute amount for meter %q rule %q: %w", meter.Key, ratingRule.RuleKey, err)
 		}
 
 		// Unit amount is amount / quantity, rounded to nearest cent. The
