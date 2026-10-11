@@ -320,7 +320,7 @@ type NoPaymentMethodNotifier interface {
 // card-less invoices out of dunning forever. Wire in router.go via
 // SetDunningStarter.
 type DunningStarter interface {
-	StartDunning(ctx context.Context, tenantID, invoiceID, customerID string, issuedAt time.Time, cause domain.DunningStartCause) error
+	StartDunning(ctx context.Context, tenantID, invoiceID, customerID string, simFailedAt time.Time, cause domain.DunningStartCause) error
 }
 
 // DunningResolver resolves an active dunning run when an invoice settles via a
@@ -5540,7 +5540,12 @@ func (e *Engine) processAutoCharge(ctx context.Context, pending []domain.Invoice
 			// A resolve ERROR is not "no card", so it starts nothing.
 			// StartDunning is idempotent: one run per invoice, ever.
 			if err == nil {
-				if derr := e.dunningStarter.StartDunning(ctx, inv.TenantID, inv.ID, inv.CustomerID, inv.IssuedAtOrZero(), domain.DunningCauseNoPaymentMethod); derr != nil {
+				// Anchored on settleAt, the instant this collection runs in the
+				// invoice's time domain: a cycle invoice's close when collected
+				// at finalize, the clock's now for a draft finalized on a later
+				// Advance (a paused subscription's). Its issue instant would date
+				// that draft's first retry in the past.
+				if derr := e.dunningStarter.StartDunning(ctx, inv.TenantID, inv.ID, inv.CustomerID, settleAt, domain.DunningCauseNoPaymentMethod); derr != nil {
 					// Left queued: the next sweep retries the start.
 					errs = append(errs, fmt.Errorf("start no-payment dunning for %s: %w", inv.ID, derr))
 				}
