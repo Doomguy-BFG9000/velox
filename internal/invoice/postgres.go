@@ -600,26 +600,47 @@ func (s *PostgresStore) UpdateStatusWithReversalPrior(ctx context.Context, tenan
 	}
 	defer postgres.Rollback(tx)
 
-	// Row lock + true prior status; same row the CAS below updates, so no
+	var fn func(tx *sql.Tx, prior domain.Invoice) error
+	if reverseFn != nil {
+		fn = func(tx *sql.Tx, prior domain.Invoice) error { return reverseFn(tx, prior.Status) }
+	}
+	inv, err := s.UpdateStatusWithReversalPriorTx(ctx, tx, tenantID, id, status, fn)
+	if err != nil {
+		return domain.Invoice{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Invoice{}, err
+	}
+	return inv, nil
+}
+
+// UpdateStatusWithReversalPriorTx is the flip on the CALLER's tx: it locks the
+// row, hands the closure the invoice as it is UNDER THE LOCK (so a caller can
+// re-check what its earlier snapshot assumed), then flips the status and runs
+// the closure's writes on the same tx. The billing engine voids a fully-unused
+// unpaid prebill this way inside the cancel / plan-swap transaction, so the
+// relief commits — or rolls back — with the change that caused it.
+func (s *PostgresStore) UpdateStatusWithReversalPriorTx(ctx context.Context, tx *sql.Tx, tenantID, id string, status domain.InvoiceStatus, fn func(tx *sql.Tx, prior domain.Invoice) error) (domain.Invoice, error) {
+	// Row lock + the true prior state; same row the CAS below updates, so no
 	// new lock ordering edge.
-	var prior string
+	var prior domain.Invoice
 	if err := tx.QueryRowContext(ctx,
-		`SELECT status FROM invoices WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
-		id, tenantID).Scan(&prior); err != nil {
+		`SELECT `+invCols+` FROM invoices WHERE id = $1 AND tenant_id = $2 FOR UPDATE`,
+		id, tenantID).Scan(s.scanInvDest(&prior)...); err != nil {
+		if err == sql.ErrNoRows {
+			return domain.Invoice{}, errs.ErrNotFound
+		}
 		return domain.Invoice{}, fmt.Errorf("lock invoice for status flip: %w", err)
 	}
-
 	inv, err := s.updateStatusInTx(ctx, tx, id, status)
 	if err != nil {
 		return domain.Invoice{}, err
 	}
-	if reverseFn != nil {
-		if err := reverseFn(tx, domain.InvoiceStatus(prior)); err != nil {
+	// The closure's error aborts the caller's tx, flip included.
+	if fn != nil {
+		if err := fn(tx, prior); err != nil {
 			return domain.Invoice{}, err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return domain.Invoice{}, err
 	}
 	return inv, nil
 }
@@ -1411,13 +1432,29 @@ func (s *PostgresStore) ApplyCreditNoteTx(ctx context.Context, tx *sql.Tx, tenan
 		UPDATE invoices SET
 			amount_due_cents = GREATEST(amount_due_cents - $1, 0),
 			updated_at = $2
-		WHERE id = $3
+		WHERE id = $3 AND status = 'finalized' AND payment_status <> 'succeeded'
 		RETURNING `+invCols,
 		amountCents, now, id,
 	).Scan(s.scanInvDest(&inv)...)
 
 	if err == sql.ErrNoRows {
-		return domain.Invoice{}, errs.ErrNotFound
+		// Either no such invoice, or it is no longer an open receivable: the
+		// caller (credit-note Issue) chose the "reduce amount due" branch from
+		// a read taken before its tx, and a payment (or a finalize/void) landed
+		// since. Refuse, so its tx rolls back and the reconciler re-drives the
+		// note against the invoice's current state (a paid one is credited to
+		// the balance instead of losing the relief).
+		var status, payment string
+		rerr := tx.QueryRowContext(ctx, `SELECT status, payment_status FROM invoices WHERE id = $1`, id).Scan(&status, &payment)
+		if rerr == sql.ErrNoRows {
+			return domain.Invoice{}, errs.ErrNotFound
+		}
+		if rerr != nil {
+			return domain.Invoice{}, rerr
+		}
+		return domain.Invoice{}, errs.InvalidState(fmt.Sprintf(
+			"invoice %s is %s/%s, not an open receivable; the credit note will be re-applied against its current state", id, status, payment)).
+			WithCode("invoice_not_open_receivable")
 	}
 	if err != nil {
 		return domain.Invoice{}, err

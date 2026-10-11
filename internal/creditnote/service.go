@@ -302,7 +302,14 @@ func (s *Service) create(ctx context.Context, tenantID string, input CreateInput
 	if inv.Status == domain.InvoiceVoided {
 		return domain.CreditNote{}, errs.InvalidState("cannot create credit notes for voided invoices")
 	}
-	if inv.Status != domain.InvoiceFinalized && inv.Status != domain.InvoicePaid {
+	// A DRAFT source is allowed for one case only: the engine's issue_pending
+	// relief note for a cancel or plan swap whose funding invoice is still a
+	// draft (pause_collection keep_as_draft). Issue holds such a note until the
+	// invoice is finalized, and voids it if the draft is voided instead
+	// (ADR-118). An operator credit note still needs an issued invoice — a
+	// draft is edited, not credited.
+	reliefOnDraft := input.IssuePending && inv.Status == domain.InvoiceDraft
+	if inv.Status != domain.InvoiceFinalized && inv.Status != domain.InvoicePaid && !reliefOnDraft {
 		return domain.CreditNote{}, errs.InvalidState("can only create credit notes for finalized or paid invoices")
 	}
 	// ADR-078 D4: commit funding invoices are cash instruments — no credit
@@ -456,9 +463,9 @@ func (s *Service) create(ctx context.Context, tenantID string, input CreateInput
 // card refund is produced — Issue's unpaid branch simply lowers amount_due and
 // reverses the proportional output tax. The note is a single gross-amount
 // line; Create caps grossCents at the invoice's current amount_due. Returns the
-// issued credit note. Idempotency is the caller's responsibility (BillOnCancel
-// runs once per cancel — see its contract); a second call would create a second
-// adjustment and is rejected by Create's amount_due cap once the first lands.
+// issued credit note. Idempotency is the caller's responsibility; a second call
+// would create a second adjustment and is rejected by Create's amount_due cap
+// once the first lands.
 func (s *Service) CreateAndIssueAdjustment(ctx context.Context, tenantID, invoiceID string, grossCents int64, reason, description string) (domain.CreditNote, error) {
 	// Calls the create() CORE directly (not the public Create) so the automated
 	// ADR-050 unpaid-source clawback BYPASSES the operator in-flight 409 gate in
@@ -1451,6 +1458,16 @@ func (s *Service) Issue(ctx context.Context, tenantID, id string) (domain.Credit
 	if inv.PaymentStatus.IsInFlight() {
 		slog.InfoContext(ctx, "deferring clawback issue until source payment settles",
 			"credit_note_id", cn.ID, "invoice_id", cn.InvoiceID, "payment_status", string(inv.PaymentStatus))
+		return cn, nil
+	}
+	// Same defer for a source that is still a DRAFT (a relief note written by
+	// a cancel or plan swap while collection was paused, ADR-118): nothing is
+	// owed on a draft yet, so the note waits — the reconciler re-drives it,
+	// and it applies once the invoice is finalized (or the orphan guard above
+	// voids it if the draft is voided).
+	if inv.Status == domain.InvoiceDraft {
+		slog.InfoContext(ctx, "deferring clawback issue until the source invoice is finalized",
+			"credit_note_id", cn.ID, "invoice_id", cn.InvoiceID)
 		return cn, nil
 	}
 

@@ -335,8 +335,8 @@ func (s *PostgresStore) CancelAtomic(ctx context.Context, tenantID, id string) (
 // billing failure rolls the cancel back rather than leaving a canceled sub with
 // an uninvoiced partial period (a revenue leak: there is no final-on-cancel
 // reconciler). ADR-056 coordinator pattern. The external finalize (tax commit +
-// auto-charge) and the in_advance proration credit run post-commit via the
-// caller (FinalizeOnCreateInvoice / BillOnCancel). billFn may be nil.
+// auto-charge) and the proration relief's legs run post-commit via the caller
+// (FinalizeOnCreateInvoice / FinishRelief). billFn may be nil.
 func (s *PostgresStore) CancelAtomicWithBill(ctx context.Context, tenantID, id string, billFn func(tx *sql.Tx, canceled domain.Subscription) error) (domain.Subscription, error) {
 	tx, err := s.db.BeginTx(ctx, postgres.TxTenant, tenantID)
 	if err != nil {
@@ -539,6 +539,12 @@ func (s *PostgresStore) WithTenantTx(ctx context.Context, tenantID string, fn fu
 	return s.db.WithTenantTx(ctx, tenantID, fn)
 }
 
+// ScheduledCancelSuperseded marks FireScheduledCancellationWithBill's two
+// benign race outcomes — the subscription is already terminated, or the
+// schedule changed under the fire. The caller skips only these; every other
+// error (a billing or relief failure in billFn included) is a real failure.
+const ScheduledCancelSuperseded = "scheduled_cancel_superseded"
+
 // FireScheduledCancellationWithBill is the ADR-097 mid-period variant of
 // FireScheduledCancellation: it flips the sub AND runs billFn (final
 // partial-period invoice + cancel-proration drafts) in the SAME tx, the
@@ -587,9 +593,9 @@ func (s *PostgresStore) FireScheduledCancellationWithBill(ctx context.Context, t
 			return domain.Subscription{}, err2
 		}
 		if currentStatus != string(domain.SubscriptionActive) {
-			return domain.Subscription{}, errs.InvalidState(fmt.Sprintf("scheduled cancel cannot fire on %s subscription", currentStatus))
+			return domain.Subscription{}, errs.InvalidState(fmt.Sprintf("scheduled cancel cannot fire on %s subscription", currentStatus)).WithCode(ScheduledCancelSuperseded)
 		}
-		return domain.Subscription{}, errs.InvalidState("scheduled cancel no longer current (unscheduled or re-scheduled concurrently)")
+		return domain.Subscription{}, errs.InvalidState("scheduled cancel no longer current (unscheduled or re-scheduled concurrently)").WithCode(ScheduledCancelSuperseded)
 	}
 	if err != nil {
 		return domain.Subscription{}, err
