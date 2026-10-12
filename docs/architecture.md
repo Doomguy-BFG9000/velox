@@ -21,7 +21,7 @@ internal/                     (abridged — one package per domain)
   auth/                     — API key auth (3 key types, 17 permissions)
   customer/                 — customer CRUD + billing profiles
   pricing/                  — meters, rating rules, plans, price overrides
-  subscription/             — lifecycle (draft → trialing → active → paused → canceled)
+  subscription/             — lifecycle (draft → trialing → active → canceled → archived)
   usage/                    — event ingestion + multi-dim aggregation
   invoice/                  — state machine (draft → finalized → paid) + PDF
   billing/                  — billing engine + scheduler + preview
@@ -36,3 +36,11 @@ internal/                     (abridged — one package per domain)
 
 web-v2/                     — operator dashboard (React 19 + TypeScript + Tailwind)
 ```
+
+## Tech stack
+
+**Backend** — Go 1.26, chi/v5 router, PostgreSQL 16 with RLS, `shopspring/decimal` for money, `signintech/gopdf` for invoices, Prometheus metrics.
+
+**Frontend** — React 19, TypeScript, Vite, TailwindCSS, shadcn/ui, Lucide icons.
+
+**Payments** — Stripe (PaymentIntents + Checkout Sessions). No Stripe Billing dependency.
