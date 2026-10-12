@@ -528,6 +528,13 @@ func (m *mockSubs) Get(_ context.Context, _, id string) (domain.Subscription, er
 	return s, nil
 }
 
+// RecordBillingFailure accepts the write and discards it. The write, its
+// guards and the gate are proven on real Postgres
+// (billing_failure_integration_test.go).
+func (m *mockSubs) RecordBillingFailure(context.Context, string, string, subscription.BillingFailureWrite) (bool, error) {
+	return true, nil
+}
+
 // FireScheduledCancellationTx mirrors the store's terminal close: CAS on
 // status=active AND the period snapshot; a loser sees ErrWatermarkMoved.
 func (m *mockSubs) FireScheduledCancellationTx(_ context.Context, _ *sql.Tx, _, id string, expected subscription.PeriodSnapshot, at time.Time) (domain.Subscription, error) {
@@ -4294,7 +4301,7 @@ func TestBillSubscription_PeriodMoved_RetriesOnce(t *testing.T) {
 			s.NextBillingAt = &truncated
 			m.subs["sub_1"] = s
 		}
-		n, err := engine.billSubscription(context.Background(), subs.subs["sub_1"])
+		n, err := engine.billSubscription(context.Background(), subs.subs["sub_1"], nil)
 		if err != nil {
 			t.Fatalf("billSubscription: %v", err)
 		}
@@ -4318,7 +4325,7 @@ func TestBillSubscription_PeriodMoved_RetriesOnce(t *testing.T) {
 			s.CurrentBillingPeriodEnd = &moved
 			m.subs["sub_1"] = s
 		}
-		n, err := engine.billSubscription(context.Background(), subs.subs["sub_1"])
+		n, err := engine.billSubscription(context.Background(), subs.subs["sub_1"], nil)
 		if err != nil || n != 0 {
 			t.Fatalf("billSubscription = (%d, %v), want (0, nil): a lost race is not an error", n, err)
 		}

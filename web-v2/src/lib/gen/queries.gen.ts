@@ -75,6 +75,7 @@ import type {
   PostV1PlansBody,
   PostV1RatingRulesBody,
   PostV1SubscriptionsBody,
+  PostV1SubscriptionsIdRetryBilling200,
   PostV1TestClocks201,
   PostV1TestClocksBody,
   PostV1TestClocksIdAdvance200,
@@ -2120,6 +2121,103 @@ export const usePostV1SubscriptionsIdActivate = <TError = unknown,
         TContext
       > => {
       return useMutation(getPostV1SubscriptionsIdActivateMutationOptions(options), queryClient);
+    }
+
+export const getPostV1SubscriptionsIdRetryBillingUrl = (id: string,) => {
+
+
+
+
+  return `/v1/subscriptions/${id}/retry-billing`
+}
+
+/**
+ * Clears the subscription's `billing_failure` and bills it now, with
+ * the same attempt the billing run makes. Use it after fixing the
+ * cause of a failure, to skip the wait, or to restart a parked
+ * subscription. An audit log entry records the retry.
+ *
+ * Once the failure is cleared, the outcome of the attempt is never
+ * an HTTP error. A 200 has three outcomes:
+ *
+ * - **Billed.** No `billing_failure`, and `still_due` is false. A
+ *   subscription that was overdue for several periods is billed for
+ *   each of them, one invoice per period.
+ * - **Failed again.** The subscription carries a new
+ *   `billing_failure` with `attempts: 1`, and the billing run then
+ *   retries on its own schedule. This includes an attempt that
+ *   finished without an error but left the subscription due.
+ * - **Not completed.** No `billing_failure`, and `still_due` is
+ *   true. The attempt was cut short by a lost database connection
+ *   or a deadlock, and nothing was saved. The subscription is still
+ *   unbilled, and the next billing run attempts it. Calling this
+ *   endpoint again answers 409, because the failure is already
+ *   cleared.
+ *
+ * The call bills inline. If it times out part-way through a long
+ * catch-up, the response is an error, the invoices already created
+ * stay, and the next billing run finishes the rest. The failure may
+ * already be cleared at that point, so a repeat call can answer 409.
+ * @summary Retry billing on a subscription whose billing is failing
+ */
+export const postV1SubscriptionsIdRetryBilling = async (id: string, options?: RequestInit): Promise<PostV1SubscriptionsIdRetryBilling200> => {
+
+  return orvalClient<PostV1SubscriptionsIdRetryBilling200>(getPostV1SubscriptionsIdRetryBillingUrl(id),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getPostV1SubscriptionsIdRetryBillingMutationOptions = <TError = void,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof postV1SubscriptionsIdRetryBilling>>, TError,{id: string}, TContext>, request?: SecondParameter<typeof orvalClient>}
+): UseMutationOptions<Awaited<ReturnType<typeof postV1SubscriptionsIdRetryBilling>>, TError,{id: string}, TContext> => {
+
+const mutationKey = ['postV1SubscriptionsIdRetryBilling'];
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof postV1SubscriptionsIdRetryBilling>>, {id: string}> = (props) => {
+          const {id} = props ?? {};
+
+          return  postV1SubscriptionsIdRetryBilling(id,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type PostV1SubscriptionsIdRetryBillingMutationResult = NonNullable<Awaited<ReturnType<typeof postV1SubscriptionsIdRetryBilling>>>
+
+    export type PostV1SubscriptionsIdRetryBillingMutationError = void
+
+    /**
+ * @summary Retry billing on a subscription whose billing is failing
+ */
+export const usePostV1SubscriptionsIdRetryBilling = <TError = void,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof postV1SubscriptionsIdRetryBilling>>, TError,{id: string}, TContext>, request?: SecondParameter<typeof orvalClient>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof postV1SubscriptionsIdRetryBilling>>,
+        TError,
+        {id: string},
+        TContext
+      > => {
+      return useMutation(getPostV1SubscriptionsIdRetryBillingMutationOptions(options), queryClient);
     }
 
 export const getPostV1UsageEventsUrl = () => {

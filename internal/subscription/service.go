@@ -91,6 +91,15 @@ type Biller interface {
 	FinalizeOnCreateInvoice(ctx context.Context, sub domain.Subscription, inv domain.Invoice)
 }
 
+// DueBiller bills one subscription now, through the same attempt the billing
+// run makes (period CAS, failure record and all). It is the bill half of the
+// operator's retry-billing action (ADR-119). Its own one-method interface, not
+// a method on Biller, so the fakes of that interface do not all grow.
+// Implemented by *billing.Engine.
+type DueBiller interface {
+	BillDueNow(ctx context.Context, tenantID, subscriptionID string) (invoicesGenerated int, err error)
+}
+
 // PlanReader (defined in handler.go) is also used at sub-lifecycle
 // entry points (Create / Activate / EndTrial / ExtendTrial) to read
 // BillingInterval for yearly-aware period anchoring (Bug #10).
@@ -105,6 +114,7 @@ type Service struct {
 	profiles  ProfileCurrencyReader
 	plans     PlanReader
 	biller    Biller
+	dueBiller DueBiller
 	resolver  clock.Resolver
 	events    domain.EventDispatcher
 	audit     AuditLogger
@@ -214,6 +224,12 @@ func (s *Service) dispatchEvent(ctx context.Context, tenantID, eventType string,
 // because most don't exercise the day-1 invoice path.
 func (s *Service) SetBiller(b Biller) {
 	s.biller = b
+}
+
+// SetDueBiller wires the engine for RetryBilling. Without it a retry still
+// clears the failure record, and the next billing run bills the subscription.
+func (s *Service) SetDueBiller(b DueBiller) {
+	s.dueBiller = b
 }
 
 // SetResolver wires the unified clock.Resolver used to bind
@@ -1886,8 +1902,8 @@ func (s *Service) FireDueScheduledCancel(ctx context.Context, tenantID, id strin
 	if err != nil {
 		// Only the fire's own race outcomes are benign. A relief or billing
 		// refusal is also an InvalidState, and skipping it silently left the
-		// subscription active past its cancel_at; it is returned, so the scan
-		// reports it and retries next tick.
+		// subscription active past its cancel_at; it is returned, so the
+		// billing run reports it and saves it as a billing failure (ADR-119).
 		if errs.Code(err) == ScheduledCancelSuperseded {
 			slog.InfoContext(ctx, "due scheduled cancel: benign race, skipping",
 				"subscription_id", id, "tenant_id", tenantID, "reason", err.Error())
@@ -2005,6 +2021,110 @@ func (s *Service) Cancel(ctx context.Context, tenantID, id string) (domain.Subsc
 	}
 
 	return canceled, prorationCreditCents, nil
+}
+
+// RetryBillingResult is what one retry-billing call did.
+type RetryBillingResult struct {
+	// Subscription is the row re-read after the attempt. Its BillingFailure
+	// is set when the attempt failed and the failure was saved.
+	Subscription domain.Subscription
+	// InvoicesGenerated counts the period-close invoices the attempt created.
+	// A scheduled cancel's final invoice and a trial-end first invoice are
+	// not counted, so 0 does not mean failure.
+	InvoicesGenerated int
+	// StillDue is true when, after the attempt, the subscription has no saved
+	// failure and is still due: the attempt did not complete and nothing was
+	// saved (a lost connection, a deadlock abort, a failed failure-write).
+	// The subscription is unbilled; the next billing run attempts it.
+	StillDue bool
+}
+
+// RetryBilling is the operator's exit from a failing or parked subscription
+// (ADR-119): POST /v1/subscriptions/{id}/retry-billing.
+//
+// It clears the saved failure record and writes the audit row in one
+// transaction, then bills the subscription inline with the same attempt the
+// billing run makes. Clear first, then attempt, for three reasons: the audit
+// row shares a transaction with a real state change; repeated clicks can
+// never park a subscription, because each one starts the count again; and the
+// attempt needs no special path past the gate.
+//
+// A subscription with no live record answers InvalidState (409, code
+// billing_not_failing) and writes nothing. Once the clear has committed, the
+// attempt's outcome is never an error. It is one of three results:
+//
+//   - Billed, or nothing was left to bill: no BillingFailure, StillDue false.
+//   - Failed again, and the failure was saved: BillingFailure is set (attempt
+//     1, next attempt in 15 minutes) and the billing run resumes on its own.
+//     This includes an attempt that returned cleanly but left the
+//     subscription due.
+//   - The attempt did not complete and nothing was saved (a lost connection,
+//     a deadlock abort, a failure-write that failed): no BillingFailure,
+//     StillDue true. The next billing run attempts the subscription.
+//
+// The third is deliberately not an error. The clear and its audit row are
+// committed, so a caller that retried after a 5xx would get 409
+// billing_not_failing for a subscription that is still unbilled.
+//
+// If the process dies after the clear commits and before the bill, the
+// subscription is simply due and healthy, and the next billing run bills it.
+func (s *Service) RetryBilling(ctx context.Context, tenantID, id string) (RetryBillingResult, error) {
+	sub, err := s.store.Get(ctx, tenantID, id)
+	if err != nil {
+		return RetryBillingResult{}, err
+	}
+	if sub.TestClockID != "" {
+		return RetryBillingResult{}, errs.InvalidState("this subscription is on a test clock; use Retry advance on the clock")
+	}
+
+	if _, err := s.store.ClearBillingFailure(ctx, tenantID, id, func(tx *sql.Tx, cleared domain.BillingFailure) error {
+		if s.audit == nil {
+			return nil
+		}
+		// ADR-090: the row rides the clear's transaction, so there is never
+		// an un-park without its evidence, nor evidence of one that rolled
+		// back.
+		if auditErr := s.audit.LogInTx(ctx, tx, audit.Entry{
+			Action:        domain.AuditActionUpdate,
+			ResourceType:  "subscription",
+			ResourceID:    sub.ID,
+			ResourceLabel: sub.Code,
+			Metadata: map[string]any{
+				"action":            "billing_retried",
+				"customer_id":       sub.CustomerID,
+				"attempts_before":   cleared.Attempts,
+				"was_parked":        cleared.Parked,
+				"last_error_before": cleared.LastError,
+				"failed_at_before":  cleared.FailedAt.UTC(),
+			},
+		}); auditErr != nil {
+			return fmt.Errorf("audit emission: %w", auditErr)
+		}
+		return nil
+	}); err != nil {
+		return RetryBillingResult{}, err
+	}
+
+	// After commit, on the request ctx. The engine saves a counted failure and
+	// logs every failure, including its own reads. The error is not returned
+	// to the operator (see above); the outcome is read off the re-read row.
+	var res RetryBillingResult
+	var billErr error
+	if s.dueBiller != nil {
+		res.InvoicesGenerated, billErr = s.dueBiller.BillDueNow(ctx, tenantID, id)
+	}
+
+	res.Subscription, err = s.store.Get(ctx, tenantID, id)
+	if err != nil {
+		return RetryBillingResult{}, err
+	}
+	res.StillDue = res.Subscription.BillingFailure == nil && domain.BillingDueAt(res.Subscription, s.clock.Now(ctx))
+	if billErr != nil && res.Subscription.BillingFailure == nil {
+		// The one outcome with no saved record to show for it.
+		slog.Warn("retry-billing: the attempt failed and no failure was saved; the next billing run attempts the subscription",
+			"subscription_id", id, "tenant_id", tenantID, "still_due", res.StillDue, "error", billErr)
+	}
+	return res, nil
 }
 
 // ScheduleCancelInput carries the soft-cancel intent. Exactly one of
@@ -2519,7 +2639,8 @@ func (s *Service) ProcessExpiredTrials(ctx context.Context, batch int) (int, []e
 		}
 		// ADR-056: build the day-1 in_advance invoice IN THE SAME tx as the
 		// trialing→active flip, so a billing failure rolls the activation back
-		// (the sub stays trialing and is retried next tick) rather than leaving
+		// (the sub stays trialing; this scan retries it next tick unless the
+		// billing run has saved a failure for it, ADR-119) rather than leaving
 		// an active sub with no first-period invoice — a revenue leak (the cycle
 		// scheduler skips the just-elapsed in_advance segment).
 		var firstInv domain.Invoice

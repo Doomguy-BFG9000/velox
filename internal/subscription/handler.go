@@ -436,6 +436,7 @@ func (h *Handler) Routes() chi.Router {
 	r.Delete("/{id}/pause-collection", h.resumeCollection)
 	r.Post("/{id}/end-trial", h.endTrial)
 	r.Post("/{id}/extend-trial", h.extendTrial)
+	r.Post("/{id}/retry-billing", h.retryBilling)
 
 	// Billing thresholds — Stripe-parity hard-cap config. PUT writes the full
 	// (amount, reset, items) triple; DELETE clears it. Idempotent.
@@ -492,11 +493,21 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 
+	// ?billing=failing lists the subscriptions whose billing is failing
+	// (ADR-119). It is a closed set: an unknown value is a 400, never an
+	// unfiltered list that looks like "everything is failing".
+	billing := r.URL.Query().Get("billing")
+	if billing != "" && billing != ListBillingFailing {
+		respond.BadRequest(w, r, `billing must be "failing" when set`)
+		return
+	}
+
 	subs, total, err := h.svc.List(r.Context(), ListFilter{
 		TenantID:   tenantID,
 		CustomerID: r.URL.Query().Get("customer_id"),
 		PlanID:     r.URL.Query().Get("plan_id"),
 		Status:     r.URL.Query().Get("status"),
+		Billing:    billing,
 		Search:     strings.TrimSpace(r.URL.Query().Get("search")),
 		Limit:      limit,
 		Offset:     offset,
@@ -694,6 +705,34 @@ func (h *Handler) endTrial(w http.ResponseWriter, r *http.Request) {
 	// end-trial tx (store-level DispatchTx subset) — do not also fire it here.
 
 	h.respondSub(w, r, http.StatusOK, sub)
+}
+
+// retryBilling is the operator's retry for a subscription whose billing is
+// failing or parked (ADR-119). It clears the saved failure (with its audit row,
+// in one transaction) and bills the subscription now.
+//
+// 200 carries the subscription, invoices_generated and still_due, and has
+// three outcomes: billed (no billing_failure, still_due false); failed again
+// and saved (billing_failure set); or the attempt did not complete and nothing
+// was saved (no billing_failure, still_due true: unbilled, the next billing
+// run attempts it). 409 billing_not_failing when there is nothing to retry,
+// 409 invalid_state for a subscription on a test clock. The audit row is the
+// service's; the handler emits none.
+func (h *Handler) retryBilling(w http.ResponseWriter, r *http.Request) {
+	tenantID := auth.TenantID(r.Context())
+	id := chi.URLParam(r, "id")
+
+	res, err := h.svc.RetryBilling(r.Context(), tenantID, id)
+	if err != nil {
+		respond.FromError(w, r, err, "subscription")
+		return
+	}
+	h.stampPeriodDisplay(r.Context(), &res.Subscription)
+	respond.JSON(w, r, http.StatusOK, map[string]any{
+		"subscription":       res.Subscription,
+		"invoices_generated": res.InvoicesGenerated,
+		"still_due":          res.StillDue,
+	})
 }
 
 // extendTrial pushes a trialing subscription's trial_end_at later. Body:
@@ -3145,6 +3184,12 @@ func describeSubscriptionAction(action string, meta map[string]any, planNames ma
 			return "Collection resumed", "", "", "succeeded"
 		case "trial_ended":
 			return "Trial ended early", "", "", "info"
+		case "billing_retried":
+			d := ""
+			if v, ok := meta["attempts_before"].(float64); ok && v > 0 {
+				d = fmt.Sprintf("After %d failed attempt%s", int(v), plural(int(v)))
+			}
+			return "Billing retried", d, "", "info"
 		case "trial_extended":
 			d := ""
 			ts := ""
