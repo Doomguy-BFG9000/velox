@@ -120,6 +120,9 @@ jobs:
         env:
           TEST_ADMIN_DATABASE_URL: postgres://velox:velox@localhost:5432/velox_test?sslmode=disable
           TEST_DATABASE_URL: postgres://velox_test_app:velox_test_app@localhost:5432/velox_test?sslmode=disable
+          # A database call that forgot to say live or test mode panics
+          # instead of logging a warning.
+          VELOX_LIVEMODE_STRICT: "true"
 
       # Money-invariant sweep over whatever the integration suite left behind
       # (docs/dev/product-stability-plan.md B1). The doctor's own test already
@@ -195,6 +198,8 @@ jobs:
 
       - name: Integration Tests through PgBouncer (transaction mode)
         run: PGB_MODE=ci scripts/pgbouncer-test.sh
+        env:
+          VELOX_LIVEMODE_STRICT: "true"
 
   # Golden path: the README quickstart + scripts/demo.sh, executed for real.
   # This is the whole wedge chain in one run — recipe → test-clock customer →
@@ -254,13 +259,23 @@ jobs:
         run: |
           nohup go run ./cmd/velox > server.log 2>&1 &
           for i in $(seq 1 60); do
-            curl -sf http://localhost:8080/health >/dev/null 2>&1 && exit 0
+            curl -sf http://localhost:8080/health >/dev/null 2>&1 && break
             sleep 1
           done
-          echo "server never became healthy"; tail -50 server.log; exit 1
+          curl -sf http://localhost:8080/health >/dev/null || { echo "server never became healthy"; tail -50 server.log; exit 1; }
+          # Without this line the server has fallen back to the owner
+          # connection, where row-level security does not apply, and the
+          # demo would pass without tenant isolation being on.
+          grep -q 'using app database connection (RLS enforced)' server.log \
+            || { echo "server is not on the app connection: row-level security is off"; tail -50 server.log; exit 1; }
 
       - name: Run the golden path (scripts/demo.sh)
         run: ./scripts/demo.sh "$(cat secret.key)"
+
+      # The same sweep the test job runs, here over rows written by the real
+      # server through its API: an invoice, usage, a subscription.
+      - name: Money-invariant sweep over the demo data (velox-doctor)
+        run: go run ./cmd/velox-doctor
 
       - name: Server log on failure
         if: failure()
