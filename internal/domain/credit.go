@@ -104,3 +104,19 @@ type CreditBalance struct {
 	TotalUsed    int64  `json:"total_used"`
 	TotalExpired int64  `json:"total_expired"`
 }
+
+// CreditLiveBalance is a customer's credit position right now (issue #1019):
+// the credit that can be spent (the settled ledger balance, without any grant
+// past its expiry that the sweep has not written off), the usage of the
+// current period(s) that no invoice has billed yet, and the difference,
+// floored at zero. The parts are
+// returned beside the result so a caller can see how far past zero a customer
+// is (BalanceCents - UnbilledUsageCents) and so the arithmetic on a page adds
+// up. Computed on read by billing.Engine.LiveCreditBalance; nothing is stored.
+type CreditLiveBalance struct {
+	CustomerID              string    `json:"customer_id"`
+	BalanceCents            int64     `json:"balance_cents"`
+	UnbilledUsageCents      int64     `json:"unbilled_usage_cents"`
+	EstimatedRemainingCents int64     `json:"estimated_remaining_cents"`
+	ComputedAt              time.Time `json:"computed_at"`
+}
