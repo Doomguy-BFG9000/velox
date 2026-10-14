@@ -1880,7 +1880,7 @@ components:
             $ref: "#/components/schemas/Invoice"
         outstanding_balance:
           type: object
-          required: [total_cents, unpaid_count]
+          required: [total_cents, unpaid_count, by_currency]
           description: |
             Invoices that are not draft, voided or uncollectible and
             whose payment is pending, failed or unknown.
@@ -1888,9 +1888,21 @@ components:
             total_cents:
               type: integer
               format: int64
-              description: Sum of `amount_due_cents`. Amounts in different currencies are added together.
+              description: Sum of `amount_due_cents`. Amounts in different currencies are added together, so use `by_currency` to show an amount.
             unpaid_count:
               type: integer
+            by_currency:
+              type: array
+              description: Amount due on the same invoices, one entry per currency, largest first. Empty when nothing is owed.
+              items:
+                type: object
+                required: [currency, amount_cents]
+                properties:
+                  currency:
+                    type: string
+                  amount_cents:
+                    type: integer
+                    format: int64
 
     PaymentMethod:
       type: object
@@ -2228,6 +2240,7 @@ components:
         - revenue
         - revenue_prev
         - outstanding_ar
+        - outstanding_by_currency
         - avg_invoice_value
         - credit_balance_total
         - active_customers
@@ -2254,7 +2267,7 @@ components:
           $ref: "#/components/schemas/AnalyticsPeriod"
         currency:
           type: string
-          description: The tenant's default currency. Every money field uses it.
+          description: The tenant's default currency. Every money field uses it, except `credit_balance_total` and `outstanding_by_currency`.
         mrr:
           type: integer
           format: int64
@@ -2282,7 +2295,24 @@ components:
         outstanding_ar:
           type: integer
           format: int64
-          description: Amount due on finalized invoices whose payment has not succeeded.
+          description: Amount due on finalized invoices whose payment has not succeeded, in `currency` only.
+        outstanding_by_currency:
+          type: array
+          description: |
+            Amount due on the invoices `open_invoices` counts, one entry per
+            currency. `currency` comes first, then the largest amount. Empty
+            when nothing is owed.
+          items:
+            type: object
+            required:
+              - currency
+              - amount_cents
+            properties:
+              currency:
+                type: string
+              amount_cents:
+                type: integer
+                format: int64
         avg_invoice_value:
           type: integer
           format: int64
@@ -2707,7 +2737,7 @@ components:
 
     DunningStats:
       type: object
-      required: [active_count, escalated_count, resolved_count, at_risk_cents, currency]
+      required: [active_count, escalated_count, resolved_count, at_risk_cents, currency, at_risk_by_currency]
       properties:
         active_count:
           type: integer
@@ -2722,6 +2752,21 @@ components:
         currency:
           type: string
           description: The tenant's default currency.
+        at_risk_by_currency:
+          type: array
+          description: |
+            Amount due on active and escalated runs, one entry per currency.
+            `currency` comes first, then the largest amount. Empty when no run
+            is at risk.
+          items:
+            type: object
+            required: [currency, amount_cents]
+            properties:
+              currency:
+                type: string
+              amount_cents:
+                type: integer
+                format: int64
 
     MeterPricingRule:
       type: object
@@ -4227,6 +4272,15 @@ paths:
                     type: string
         "404":
           description: Customer not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: |
+            `email_not_configured`: this server has no SMTP set up. Nothing
+            was sent and no setup link was created. Like any other call, it
+            starts the one-minute cooldown.
           content:
             application/json:
               schema:
@@ -7459,6 +7513,15 @@ paths:
           description: Email enqueued
         "404":
           description: Invoice not found
+        "409":
+          description: |
+            Nothing was sent. Codes: `email_not_configured` (this server
+            has no SMTP set up), or `payment_in_flight` /
+            `payment_unidentifiable` (a charge on the invoice is unresolved).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "422":
           description: Invalid recipient or CC entry
 
@@ -7600,7 +7663,8 @@ paths:
           description: |
             Nothing was sent. Codes: `invoice_not_collectible` (the invoice
             is draft, voided or paid), `payment_in_flight` or
-            `payment_unidentifiable` (a charge is unresolved), or
+            `payment_unidentifiable` (a charge is unresolved),
+            `email_not_configured` (this server has no SMTP set up), or
             `no_email_on_file` (the customer has no email address).
           content:
             application/json:
@@ -7961,6 +8025,14 @@ paths:
           description: Email enqueued
         "404":
           description: Credit note not found
+        "409":
+          description: |
+            Nothing was sent. `email_not_configured`: this server has no
+            SMTP set up.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "422":
           description: Not issued (draft/voided), or invalid recipient
 
@@ -8632,7 +8704,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/MemberInvitation"
         "409":
-          description: Already a member, or a pending invitation exists
+          description: |
+            No invitation was created when the code is
+            `email_not_configured` (this server has no SMTP set up, so the
+            accept link could not be delivered) or `invalid_state`
+            (`DASHBOARD_BASE_URL` is not set). Also returned when the email
+            is already a member or already has a pending invitation.
           content:
             application/json:
               schema:

@@ -8,8 +8,10 @@ import { useForm, Controller } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import { toast } from 'sonner'
-import { api, ApiError, formatCents, formatDate, formatDateTime, getCurrencySymbol, type Customer, type BillingProfile, type Invoice, type DunningPolicyWithCount, type Subscription, type CustomerPaymentMethod } from '@/lib/api'
+import { api, ApiError, amountsByCurrencyText, formatCents, formatDate, formatDateTime, getCurrencySymbol, type Customer, type BillingProfile, type Invoice, type DunningPolicyWithCount, type Subscription, type CustomerPaymentMethod } from '@/lib/api'
 import { applyApiError, showApiError } from '@/lib/formErrors'
+import { isEmailNotConfigured, newInvoiceOutcome, type NewInvoiceResult } from '@/lib/actionOutcomes'
+import { showOutcome } from '@/lib/outcomeToast'
 import { billingProfileCard, profileOrAbsent } from '@/lib/billingProfileLoad'
 import { endOfDayInTZ, startOfDayInTZ } from '@/lib/dates'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -234,6 +236,7 @@ export default function CustomerDetailPage() {
     enabled: !!id,
   })
   const balance = balanceData?.balance_cents
+  const outstandingAmounts = amountsByCurrencyText(overview?.outstanding_balance?.by_currency ?? [])
 
   // Only a 404 means "no profile". Any other failure must not offer Set Up:
   // saving that blank form would replace a profile that exists.
@@ -246,6 +249,14 @@ export default function CustomerDetailPage() {
     enabled: !!id,
   })
   const profileCard = billingProfileCard({ data: billingProfile, isError: billingProfileError })
+
+  // Credits have no currency of their own: the ledger is drawn down 1:1
+  // against whatever currency this customer's invoices are in (ADR-100).
+  // So show them in the customer's billing currency, then their invoices'
+  // currency; the workspace default only when neither exists.
+  const creditCurrency = billingProfile?.currency
+    || overview?.recent_invoices?.find(inv => inv.currency)?.currency
+    || undefined
 
   const { data: metersData } = useQuery({
     queryKey: ['meters'],
@@ -572,15 +583,15 @@ export default function CustomerDetailPage() {
               <Link to={`/credits?customer=${id}`} className="flex-1 px-6 py-4 hover:bg-accent/50 transition-colors">
                 <p className="text-sm text-muted-foreground">Credit Balance</p>
                 <p className={cn('text-sm font-medium mt-1', (balance ?? 0) > 0 ? 'text-emerald-600' : 'text-foreground')}>
-                  {balance === undefined ? '—' : formatCents(balance)}
+                  {balance === undefined ? '—' : formatCents(balance, creditCurrency)}
                 </p>
                 {/* Kind split — money-backed commit liability must not read
                     as one number with free promo credits. */}
                 {creditGrants && (creditGrants.commit_remaining_cents > 0 || creditGrants.promotional_remaining_cents > 0) && (
                   <p className="text-xs text-muted-foreground mt-0.5">
-                    {creditGrants.commit_remaining_cents > 0 && <>Commit {formatCents(creditGrants.commit_remaining_cents)}</>}
+                    {creditGrants.commit_remaining_cents > 0 && <>Commit {formatCents(creditGrants.commit_remaining_cents, creditCurrency)}</>}
                     {creditGrants.commit_remaining_cents > 0 && creditGrants.promotional_remaining_cents > 0 && ' · '}
-                    {creditGrants.promotional_remaining_cents > 0 && <>Promo {formatCents(creditGrants.promotional_remaining_cents)}</>}
+                    {creditGrants.promotional_remaining_cents > 0 && <>Promo {formatCents(creditGrants.promotional_remaining_cents, creditCurrency)}</>}
                   </p>
                 )}
               </Link>
@@ -593,12 +604,13 @@ export default function CustomerDetailPage() {
                 invoices filtered to their unpaid list so the operator
                 can drill into resolution. Hidden when there's no
                 exposure — keeps the row uncluttered on healthy
-                customers. */}
-            {(overview?.outstanding_balance?.total_cents ?? 0) > 0 && (
+                customers. One figure per currency: total_cents adds
+                currencies together. */}
+            {outstandingAmounts && (
               <Link to={`/invoices?customer=${id}`} className="flex-1 px-6 py-4 hover:bg-accent/50 transition-colors">
                 <p className="text-sm text-muted-foreground">Outstanding</p>
                 <p className="text-sm font-medium mt-1 text-red-600">
-                  {formatCents(overview?.outstanding_balance?.total_cents ?? 0)}
+                  {outstandingAmounts}
                   <span className="text-xs text-muted-foreground ml-1.5 font-normal">
                     · {overview?.outstanding_balance?.unpaid_count} invoice{overview?.outstanding_balance?.unpaid_count === 1 ? '' : 's'}
                   </span>
@@ -902,9 +914,9 @@ export default function CustomerDetailPage() {
                         : g.grant_kind === 'promotional' ? <Badge variant="secondary">Promo</Badge>
                         : <Badge variant="outline">Credit</Badge>}
                     </TableCell>
-                    <TableCell className="text-sm text-right">{formatCents(g.amount_cents)}</TableCell>
-                    <TableCell className="text-sm text-right">{formatCents(g.consumed_cents)}</TableCell>
-                    <TableCell className="text-sm text-right font-medium">{formatCents(g.remaining_cents)}</TableCell>
+                    <TableCell className="text-sm text-right">{formatCents(g.amount_cents, creditCurrency)}</TableCell>
+                    <TableCell className="text-sm text-right">{formatCents(g.consumed_cents, creditCurrency)}</TableCell>
+                    <TableCell className="text-sm text-right font-medium">{formatCents(g.remaining_cents, creditCurrency)}</TableCell>
                     <TableCell className="text-sm text-muted-foreground">{g.expires_at ? formatDate(g.expires_at) : 'never'}</TableCell>
                   </TableRow>
                 ))}
@@ -1128,7 +1140,7 @@ export default function CustomerDetailPage() {
                     </div>
                     <div className="flex items-center gap-3">
                       <Badge variant={statusVariant(inv.status)}>{inv.status}</Badge>
-                      <span className="text-sm font-medium">{formatCents(inv.total_amount_cents)}</span>
+                      <span className="text-sm font-medium">{formatCents(inv.total_amount_cents, inv.currency)}</span>
                     </div>
                   </Link>
                 )
@@ -1285,25 +1297,14 @@ export default function CustomerDetailPage() {
           customer={customer}
           billingProfile={billingProfile ?? null}
           onClose={() => setShowNewInvoice(false)}
-          onCreated={({ invoice, sent }) => {
+          onCreated={({ invoice, result }) => {
             setShowNewInvoice(false)
             queryClient.invalidateQueries({ queryKey: ['customer-overview', id] })
             queryClient.invalidateQueries({ queryKey: ['invoices'] })
-            if (sent) {
-              toast.success(`Invoice ${invoice.invoice_number} sent`, {
-                action: {
-                  label: 'View invoice',
-                  onClick: () => navigate(`/invoices/${invoice.id}`),
-                },
-              })
-            } else {
-              toast.success(`Draft ${invoice.invoice_number} saved`, {
-                action: {
-                  label: 'View invoice',
-                  onClick: () => navigate(`/invoices/${invoice.id}`),
-                },
-              })
-            }
+            showOutcome(newInvoiceOutcome(invoice.invoice_number, result), {
+              label: 'View invoice',
+              onClick: () => navigate(`/invoices/${invoice.id}`),
+            })
           }}
         />
       )}
@@ -1788,7 +1789,7 @@ function NewInvoiceDialog({ customerId, customer, billingProfile, onClose, onCre
   customer: Customer
   billingProfile: BillingProfile | null
   onClose: () => void
-  onCreated: (result: { invoice: Invoice; sent: boolean }) => void
+  onCreated: (result: { invoice: Invoice; result: NewInvoiceResult }) => void
 }) {
   // Default currency: prefer the customer's billing profile currency, else
   // tenant default (USD here is a placeholder until the tenant settings query
@@ -1962,28 +1963,26 @@ function NewInvoiceDialog({ customerId, customer, billingProfile, onClose, onCre
         line_items: cleaned,
       })
 
-      let sent = false
+      // One outcome, one toast (shown by onCreated). The email step is
+      // best-effort: a failed send must not unwind a finalized invoice, and
+      // it must not be reported as a saved draft either.
+      let result: NewInvoiceResult = { kind: 'draft' }
       if (action === 'send') {
         invoice = await api.finalizeInvoice(invoice.id)
         const recipient = customer.email
         if (recipient) {
-          // Best-effort send: a transient SMTP failure shouldn't unwind a
-          // successfully finalized invoice. Operators can resend from the
-          // invoice detail page if the email never lands.
           try {
             await api.sendInvoiceEmail(invoice.id, recipient)
-            sent = true
-          } catch {
-            toast.warning(
-              `Invoice finalized, but email to ${recipient} failed. Resend from the invoice detail page.`,
-            )
+            result = { kind: 'sent' }
+          } catch (err) {
+            result = isEmailNotConfigured(err) ? { kind: 'email_not_configured' } : { kind: 'email_failed', recipient }
           }
         } else {
-          toast.warning('Invoice finalized, but no email is on file. Add one to send.')
+          result = { kind: 'no_email' }
         }
       }
 
-      onCreated({ invoice, sent })
+      onCreated({ invoice, result })
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to create invoice'
       // Partial-success messaging: if we got an invoice ID but failed mid-flight

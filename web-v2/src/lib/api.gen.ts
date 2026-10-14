@@ -2881,6 +2881,19 @@ export interface paths {
                     };
                     content?: never;
                 };
+                /**
+                 * @description Nothing was sent. Codes: `email_not_configured` (this server
+                 *     has no SMTP set up), or `payment_in_flight` /
+                 *     `payment_unidentifiable` (a charge on the invoice is unresolved).
+                 */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
                 /** @description Invalid recipient or CC entry */
                 422: {
                     headers: {
@@ -3190,6 +3203,18 @@ export interface paths {
                         [name: string]: unknown;
                     };
                     content?: never;
+                };
+                /**
+                 * @description Nothing was sent. `email_not_configured`: this server has no
+                 *     SMTP set up.
+                 */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
                 };
                 /** @description Not issued (draft/voided), or invalid recipient */
                 422: {
@@ -6893,10 +6918,16 @@ export interface components {
             outstanding_balance: {
                 /**
                  * Format: int64
-                 * @description Sum of `amount_due_cents`. Amounts in different currencies are added together.
+                 * @description Sum of `amount_due_cents`. Amounts in different currencies are added together, so use `by_currency` to show an amount.
                  */
                 total_cents: number;
                 unpaid_count: number;
+                /** @description Amount due on the same invoices, one entry per currency, largest first. Empty when nothing is owed. */
+                by_currency: {
+                    currency: string;
+                    /** Format: int64 */
+                    amount_cents: number;
+                }[];
             };
         };
         PaymentMethod: {
@@ -7133,7 +7164,7 @@ export interface components {
          */
         AnalyticsOverview: {
             period: components["schemas"]["AnalyticsPeriod"];
-            /** @description The tenant's default currency. Every money field uses it. */
+            /** @description The tenant's default currency. Every money field uses it, except `credit_balance_total` and `outstanding_by_currency`. */
             currency: string;
             /**
              * Format: int64
@@ -7167,9 +7198,19 @@ export interface components {
             revenue_prev: number;
             /**
              * Format: int64
-             * @description Amount due on finalized invoices whose payment has not succeeded.
+             * @description Amount due on finalized invoices whose payment has not succeeded, in `currency` only.
              */
             outstanding_ar: number;
+            /**
+             * @description Amount due on the invoices `open_invoices` counts, one entry per
+             *     currency. `currency` comes first, then the largest amount. Empty
+             *     when nothing is owed.
+             */
+            outstanding_by_currency: {
+                currency: string;
+                /** Format: int64 */
+                amount_cents: number;
+            }[];
             /**
              * Format: int64
              * @description Average total of invoices paid in the window.
@@ -7457,6 +7498,16 @@ export interface components {
             at_risk_cents: number;
             /** @description The tenant's default currency. */
             currency: string;
+            /**
+             * @description Amount due on active and escalated runs, one entry per currency.
+             *     `currency` comes first, then the largest amount. Empty when no run
+             *     is at risk.
+             */
+            at_risk_by_currency: {
+                currency: string;
+                /** Format: int64 */
+                amount_cents: number;
+            }[];
         };
         MeterPricingRule: {
             id: string;
@@ -8473,6 +8524,19 @@ export interface operations {
             };
             /** @description Customer not found. */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description `email_not_configured`: this server has no SMTP set up. Nothing
+             *     was sent and no setup link was created. Like any other call, it
+             *     starts the one-minute cooldown.
+             */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -10712,7 +10776,8 @@ export interface operations {
             /**
              * @description Nothing was sent. Codes: `invoice_not_collectible` (the invoice
              *     is draft, voided or paid), `payment_in_flight` or
-             *     `payment_unidentifiable` (a charge is unresolved), or
+             *     `payment_unidentifiable` (a charge is unresolved),
+             *     `email_not_configured` (this server has no SMTP set up), or
              *     `no_email_on_file` (the customer has no email address).
              */
             409: {
@@ -11364,7 +11429,13 @@ export interface operations {
                     "application/json": components["schemas"]["MemberInvitation"];
                 };
             };
-            /** @description Already a member, or a pending invitation exists */
+            /**
+             * @description No invitation was created when the code is
+             *     `email_not_configured` (this server has no SMTP set up, so the
+             *     accept link could not be delivered) or `invalid_state`
+             *     (`DASHBOARD_BASE_URL` is not set). Also returned when the email
+             *     is already a member or already has a pending invitation.
+             */
             409: {
                 headers: {
                     [name: string]: unknown;
