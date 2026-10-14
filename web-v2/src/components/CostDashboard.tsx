@@ -22,7 +22,7 @@ import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts'
 import { formatInTimeZone } from 'date-fns-tz'
-import { api, formatCents, formatRate, formatDate, getTenantTimezone } from '@/lib/api'
+import { api, amountsByCurrencyText, formatCents, formatRate, formatDate, getTenantTimezone } from '@/lib/api'
 import type { CustomerUsage, CustomerUsageMeter, CustomerUsageRule, Subscription, Invoice, InvoicePreview } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { cycleProgress, rollingWindow, sinceMs, type EffectiveNow } from '@/lib/effectiveNow'
@@ -30,9 +30,12 @@ import { useEffectiveNow, useEffectiveNowResolver } from '@/hooks/useClockFrozen
 
 import { Card, CardContent } from '@/components/ui/card'
 import { LoadError } from '@/components/LoadError'
+import { Callout } from '@/components/Callout'
+import { Button } from '@/components/ui/button'
+import { UNPRICED_SENTENCE, UNPRICED_TITLE, meterQuantityLine, unpricedLine, unpricedMeters } from '@/lib/unpricedUsage'
 import { Badge } from '@/components/ui/badge'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { ChevronDown, ChevronRight, Activity, AlertTriangle, Loader2, Receipt } from 'lucide-react'
+import { ChevronDown, ChevronRight, Activity, Loader2, Receipt } from 'lucide-react'
 
 // ============================================================================
 // Top-level wrapper
@@ -386,8 +389,12 @@ function ActivitySection({ customerId, customerTestClockId }: { customerId: stri
     },
   })
 
-  const totalCents = data?.totals.reduce((sum, t) => sum + t.amount_cents, 0) ?? 0
-  const totalEvents = data?.meters.reduce((sum, m) => sum + Number(m.total_quantity), 0) ?? 0
+  const unpriced = useMemo(() => unpricedMeters(data?.meters ?? []), [data])
+  // One figure per currency: totals has one entry per currency, and adding
+  // them would mix currencies. No "N events" line: total_quantity is billed
+  // quantity in each meter's own unit, not an event count; the meter rows
+  // below show each quantity with its unit.
+  const totalText = data ? (amountsByCurrencyText(data.totals) ?? formatCents(0, data.totals[0]?.currency)) : ''
 
   return (
     <section>
@@ -441,17 +448,8 @@ function ActivitySection({ customerId, customerTestClockId }: { customerId: stri
               projection lives on the Upcoming card above). */}
           <Card>
             <CardContent className="px-5 py-4">
-              <div className="flex items-baseline justify-between gap-4">
-                <div>
-                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Total</p>
-                  <p className="text-2xl font-semibold tabular-nums mt-1">
-                    {formatCents(totalCents, data.totals[0]?.currency)}
-                  </p>
-                </div>
-                <p className="text-xs text-muted-foreground tabular-nums">
-                  {totalEvents.toLocaleString()} event{totalEvents === 1 ? '' : 's'}
-                </p>
-              </div>
+              <p className="text-xs uppercase tracking-wide text-muted-foreground">Billed usage</p>
+              <p className="text-2xl font-semibold tabular-nums mt-1">{totalText}</p>
             </CardContent>
           </Card>
 
@@ -460,21 +458,45 @@ function ActivitySection({ customerId, customerTestClockId }: { customerId: stri
               their per-customer view around. Hidden if no events. */}
           {data.buckets.length > 0 && data.meters.length > 0 && <UsageChart usage={data} />}
 
-          {/* Warnings */}
-          {data.warnings.length > 0 && (
-            <Card className="ring-amber-200 dark:ring-amber-900">
-              <CardContent className="p-4">
-                <div className="flex items-center gap-2 text-amber-700 dark:text-amber-300 text-xs font-medium mb-2">
-                  <AlertTriangle size={12} />
-                  {data.warnings.length} warning{data.warnings.length !== 1 ? 's' : ''}
-                </div>
-                <ul className="text-xs text-amber-700 dark:text-amber-300 space-y-1">
-                  {data.warnings.map((w, i) => (
-                    <li key={i}>{w}</li>
-                  ))}
+          {/* Usage with no price: a plain notice built from the unmatched
+              rows, with the quantity per meter and a link to the meter. The
+              server's own warning sentences go in Details. */}
+          {unpriced.length > 0 ? (
+            <Callout
+              tone="amber"
+              title={UNPRICED_TITLE}
+              actions={unpriced.length === 1 ? (
+                <Button size="sm" variant="outline" render={<Link to={`/meters/${unpriced[0].meterId}`} />}>
+                  Open meter
+                </Button>
+              ) : undefined}
+              details={data.warnings.length > 0 ? (
+                <ul className="space-y-1">
+                  {data.warnings.map((w, i) => <li key={i}>{w}</li>)}
                 </ul>
-              </CardContent>
-            </Card>
+              ) : undefined}
+            >
+              <p>{UNPRICED_SENTENCE}</p>
+              {unpriced.map(m => (
+                <p key={m.meterId}>
+                  {unpriced.length > 1
+                    ? <Link to={`/meters/${m.meterId}`} className="text-primary underline-offset-2 hover:underline">{unpricedLine(m)}</Link>
+                    : unpricedLine(m)}
+                </p>
+              ))}
+            </Callout>
+          ) : data.warnings.length > 0 && (
+            <Callout
+              tone="amber"
+              title="Usage may be incomplete"
+              details={
+                <ul className="space-y-1">
+                  {data.warnings.map((w, i) => <li key={i}>{w}</li>)}
+                </ul>
+              }
+            >
+              The server reported a problem working out this usage; Details has its message.
+            </Callout>
           )}
 
           {/* Per-meter cards with rule-resolution drill-down */}
@@ -604,7 +626,6 @@ function MeterRow({ meter }: { meter: CustomerUsageMeter }) {
   const [expanded, setExpanded] = useState(false)
   const hasUnmatched = meter.rules.some(r => r.unmatched)
   const hasMultipleRules = meter.rules.length > 1 || hasUnmatched
-  const totalQty = useMemo(() => Number(meter.total_quantity), [meter.total_quantity])
 
   const visibleRules = useMemo<CustomerUsageRule[]>(() => {
     // Unmatched rows never fold into the "(N more)" bucket and always
@@ -656,14 +677,11 @@ function MeterRow({ meter }: { meter: CustomerUsageMeter }) {
               {meter.meter_name}
               {hasUnmatched && (
                 <span className="ml-2 inline-flex items-center text-[10px] font-medium text-amber-500 border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 rounded">
-                  unmatched usage — not billed
+                  usage with no price
                 </span>
               )}
             </p>
-            <p className="text-xs text-muted-foreground font-mono">
-              {totalQty.toLocaleString(undefined, { maximumFractionDigits: 6 })} {meter.unit}
-              {hasMultipleRules && <span className="ml-2">· {meter.rules.filter(r => !r.unmatched).length} rules</span>}
-            </p>
+            <p className="text-xs text-muted-foreground font-mono">{meterQuantityLine(meter)}</p>
           </div>
           <p className="text-sm font-semibold text-foreground tabular-nums shrink-0">
             {formatCents(meter.total_amount_cents, meter.currency)}
@@ -724,7 +742,7 @@ function RuleRow({
       <div className="px-5 py-3 border-b border-border last:border-b-0 space-y-1">
         <div className="flex items-baseline justify-between gap-4">
           <span className="text-xs font-medium text-amber-500">
-            No pricing rule matched — check event dimension values
+            No price matches this usage
           </span>
           <span className="text-xs font-semibold text-amber-500 shrink-0">not billed</span>
         </div>

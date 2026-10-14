@@ -25,6 +25,9 @@ import { Callout } from '@/components/Callout'
 import { CreateSubscriptionDialog } from '@/components/CreateSubscriptionDialog'
 import { cn } from '@/lib/utils'
 import { customerNeedsPaymentMethod } from '@/lib/paymentReadiness'
+import { NO_CARD_SENTENCE, NO_CARD_TITLE } from '@/lib/subscriptionNotices'
+import { cardLabel, removeCardSentence } from '@/lib/paymentMethodCopy'
+import { invalidateMoneySurfaces } from '@/lib/invalidateMoney'
 import { statusBadgeVariant } from '@/lib/status'
 
 import { Button } from '@/components/ui/button'
@@ -51,6 +54,7 @@ import {
 import { Loader2, Pencil, CreditCard, Archive, Wand2, FilePlus2, Plus, Trash2, ChevronDown, ChevronRight, History } from 'lucide-react'
 import { Textarea } from '@/components/ui/textarea'
 import { CopyButton } from '@/components/CopyButton'
+import { DetailRow } from '@/components/DetailRow'
 import { DetailBreadcrumb } from '@/components/DetailBreadcrumb'
 import { DetailSkeleton } from '@/components/ui/DetailSkeleton'
 import { Combobox } from '@/components/Combobox'
@@ -413,6 +417,10 @@ export default function CustomerDetailPage() {
     queryClient.invalidateQueries({ queryKey: ['customer-payment-methods', id] })
     queryClient.invalidateQueries({ queryKey: ['customer-dunning-override', id] })
     queryClient.invalidateQueries({ queryKey: ['customers'] })
+    // Actions on this page can move money (a subscription created or
+    // changed here may bill and draw on credit): refresh every surface that
+    // shows a balance, not just this page's own queries.
+    invalidateMoneySurfaces(queryClient, { customerId: id })
   }
 
   const loading = isLoading
@@ -447,24 +455,6 @@ export default function CustomerDetailPage() {
   return (
     <Layout>
       <DetailBreadcrumb to="/customers" parentLabel="Customers" currentLabel={customer.display_name} />
-
-      {/* Archived Banner */}
-      {isArchived && (
-        <Card className="mb-4 ring-amber-200 bg-amber-50 dark:ring-amber-900/50 dark:bg-amber-950/20">
-          <CardContent className="px-5 py-3 flex items-center justify-between">
-            <p className="text-sm text-amber-800 dark:text-amber-300">This customer has been archived. All data is read-only.</p>
-            <Button variant="outline" size="sm"
-              onClick={() => {
-                api.updateCustomer(customer.id, { status: 'active' }).then(() => {
-                  toast.success('Customer restored')
-                  invalidateAll()
-                }).catch((err: Error) => showApiError(err, 'Failed to update'))
-              }}>
-              Restore Customer
-            </Button>
-          </CardContent>
-        </Card>
-      )}
 
       {/* Header */}
       <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3 mb-6">
@@ -508,7 +498,7 @@ export default function CustomerDetailPage() {
                 <AlertDialogHeader>
                   <AlertDialogTitle>Archive {customer.display_name}?</AlertDialogTitle>
                   <AlertDialogDescription>
-                    Archiving hides this customer from active lists and blocks new subscriptions. It does <strong>not</strong> cancel existing subscriptions or stop billing — cancel any active subscriptions first. Unpaid invoices remain collectible and payment reminders continue. This can be undone.
+                    Hides the customer and blocks new subscriptions. Cancel any subscription that still bills first; unpaid invoices are still collected.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
@@ -551,14 +541,39 @@ export default function CustomerDetailPage() {
         <TestClockBanner testClockId={customer.test_clock_id} />
       )}
 
+      {/* Archived: the page's one notice. Archiving hides the customer and
+          blocks edits and new subscriptions, but collection goes on: unpaid
+          invoices are still charged and reminders still go out
+          (customer/service.go Archive). The old "All data is read-only" said
+          otherwise. */}
+      {isArchived && (
+        <Callout
+          className="mb-6"
+          title="Customer archived"
+          actions={
+            <Button variant="outline" size="sm"
+              onClick={() => {
+                api.updateCustomer(customer.id, { status: 'active' }).then(() => {
+                  toast.success('Customer restored')
+                  invalidateAll()
+                }).catch((err: Error) => showApiError(err, "Couldn't restore customer"))
+              }}>
+              Restore customer
+            </Button>
+          }
+        >
+          Editing is off, but unpaid invoices are still collected; restore the customer to make changes.
+        </Callout>
+      )}
+
       {/* Key Metrics */}
       <Card>
         <CardContent className="p-0">
-          <div className="flex divide-x divide-border">
-            <div className="flex-1 px-6 py-4">
+          <div className="flex flex-col divide-y divide-border md:flex-row md:divide-y-0 md:divide-x">
+            <div className="flex-1 min-w-0 px-6 py-4">
               <p className="text-sm text-muted-foreground">Email</p>
               <div className="flex items-center gap-2 mt-1">
-                <p className="text-sm font-medium text-foreground">{customer.email || '—'}</p>
+                <p className="text-sm font-medium text-foreground break-all">{customer.email || '—'}</p>
                 {customer.email_status === 'bounced' && (
                   <Badge variant="destructive" className="text-xs" title={customer.email_bounce_reason || 'Permanent delivery failure'}>
                     Bounced
@@ -569,7 +584,7 @@ export default function CustomerDetailPage() {
             {balanceError ? (
               // A plain cell while the fetch has failed: the retry button
               // cannot sit inside the link to the ledger.
-              <div className="flex-1 px-6 py-4">
+              <div className="flex-1 min-w-0 px-6 py-4">
                 <p className="text-sm text-muted-foreground">Credit Balance</p>
                 <div className="flex items-center gap-2 mt-1">
                   <p className="text-sm font-medium text-foreground" title="Couldn't load the credit balance">—</p>
@@ -577,7 +592,7 @@ export default function CustomerDetailPage() {
                 </div>
               </div>
             ) : (
-              <Link to={`/credits?customer=${id}`} className="flex-1 px-6 py-4 hover:bg-accent/50 transition-colors">
+              <Link to={`/credits?customer=${id}`} className="flex-1 min-w-0 px-6 py-4 hover:bg-accent/50 transition-colors">
                 <p className="text-sm text-muted-foreground">Credit Balance</p>
                 <p className={cn('text-sm font-medium mt-1', (balance ?? 0) > 0 ? 'text-emerald-600' : 'text-foreground')}>
                   {balance === undefined ? '—' : formatCents(balance, creditCurrency)}
@@ -604,7 +619,7 @@ export default function CustomerDetailPage() {
                 customers. One figure per currency: total_cents adds
                 currencies together. */}
             {outstandingAmounts && (
-              <Link to={`/invoices?customer=${id}`} className="flex-1 px-6 py-4 hover:bg-accent/50 transition-colors">
+              <Link to={`/invoices?customer=${id}`} className="flex-1 min-w-0 px-6 py-4 hover:bg-accent/50 transition-colors">
                 <p className="text-sm text-muted-foreground">Outstanding</p>
                 <p className="text-sm font-medium mt-1 text-red-600">
                   {outstandingAmounts}
@@ -614,11 +629,11 @@ export default function CustomerDetailPage() {
                 </p>
               </Link>
             )}
-            <div className="flex-1 px-6 py-4">
+            <div className="flex-1 min-w-0 px-6 py-4">
               <p className="text-sm text-muted-foreground">Subscriptions</p>
               <p className="text-sm font-medium text-foreground mt-1">{allSubs?.length ?? 0}</p>
             </div>
-            <div className="flex-1 px-6 py-4">
+            <div className="flex-1 min-w-0 px-6 py-4">
               <p className="text-sm text-muted-foreground">Created</p>
               <p className="text-sm font-medium text-foreground mt-1">{formatDateTime(customer.created_at)}</p>
             </div>
@@ -633,42 +648,29 @@ export default function CustomerDetailPage() {
         </CardHeader>
         <CardContent className="p-0">
           <div className="divide-y divide-border">
-            <div className="flex items-center justify-between px-6 py-3">
-              <span className="text-sm text-muted-foreground">External ID</span>
-              <div className="flex items-center gap-1.5">
-                <span className="text-sm text-foreground font-mono">{customer.external_id}</span>
-                {/* external_id is the identifier operators paste into
-                    API calls and support threads — same copy affordance
-                    as the internal ID below. */}
-                <CopyButton text={customer.external_id} />
-              </div>
-            </div>
-            <div className="flex items-center justify-between px-6 py-3">
-              <span className="text-sm text-muted-foreground">Email</span>
-              <span className="text-sm text-foreground flex items-center gap-2">
-                {customer.email || '—'}
-                {customer.email_status === 'bounced' && customer.email_last_bounced_at && (
-                  <Badge variant="destructive" className="text-xs" title={customer.email_bounce_reason || 'Permanent delivery failure'}>
-                    Bounced · {formatDate(customer.email_last_bounced_at)}
-                  </Badge>
-                )}
-              </span>
-            </div>
-            <div className="flex items-center justify-between px-6 py-3">
-              <span className="text-sm text-muted-foreground">Status</span>
+            <DetailRow label="External ID">
+              <span className="min-w-0 font-mono">{customer.external_id}</span>
+              {/* external_id is the identifier operators paste into
+                  API calls and support threads — same copy affordance
+                  as the internal ID below. */}
+              <CopyButton text={customer.external_id} />
+            </DetailRow>
+            <DetailRow label="Email">
+              <span className="min-w-0">{customer.email || '—'}</span>
+              {customer.email_status === 'bounced' && customer.email_last_bounced_at && (
+                <Badge variant="destructive" className="text-xs" title={customer.email_bounce_reason || 'Permanent delivery failure'}>
+                  Bounced · {formatDate(customer.email_last_bounced_at)}
+                </Badge>
+              )}
+            </DetailRow>
+            <DetailRow label="Status">
               <Badge variant={statusVariant(customer.status)}>{customer.status}</Badge>
-            </div>
-            <div className="flex items-center justify-between px-6 py-3">
-              <span className="text-sm text-muted-foreground">Created</span>
-              <span className="text-sm text-foreground">{formatDateTime(customer.created_at)}</span>
-            </div>
-            <div className="flex items-center justify-between px-6 py-3">
-              <span className="text-sm text-muted-foreground">ID</span>
-              <div className="flex items-center gap-1.5">
-                <span className="text-sm text-foreground font-mono">{customer.id}</span>
-                <CopyButton text={customer.id} />
-              </div>
-            </div>
+            </DetailRow>
+            <DetailRow label="Created">{formatDateTime(customer.created_at)}</DetailRow>
+            <DetailRow label="ID">
+              <span className="min-w-0 font-mono">{customer.id}</span>
+              <CopyButton text={customer.id} />
+            </DetailRow>
           </div>
         </CardContent>
       </Card>
@@ -952,15 +954,19 @@ export default function CustomerDetailPage() {
         <CardContent className="p-0">
           {paymentMethods.length === 0 ? (
             needsCard ? (
-              <Callout tone="amber" className="mx-6 my-4" title="No payment method on file">
-                This customer has an active subscription that bills automatically. Add a card so renewal charges can be collected — without one, the next invoice will need manual follow-up.
+              <Callout
+                tone="amber"
+                className="mx-6 my-4"
+                title={NO_CARD_TITLE}
+              >
+                {NO_CARD_SENTENCE}
               </Callout>
             ) : (
               <div className="px-6 py-8 text-center">
                 <CreditCard size={28} className="text-muted-foreground mx-auto mb-2" />
-                <p className="text-sm text-foreground">No payment methods on file</p>
+                <p className="text-sm text-foreground">No payment methods</p>
                 <p className="text-xs text-muted-foreground mt-1">
-                  Click "Add payment method" to email the customer a secure setup link.
+                  Use Add payment method to email or copy a secure setup link for the customer.
                 </p>
               </div>
             )
@@ -975,7 +981,7 @@ export default function CustomerDetailPage() {
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
                         <p className="text-sm font-medium text-foreground truncate">
-                          {(pm.card_brand || 'Card').charAt(0).toUpperCase() + (pm.card_brand || 'card').slice(1)} ····{pm.card_last4 || '????'}
+                          {cardLabel(pm)}
                         </p>
                         {pm.is_default && <Badge variant="outline" className="shrink-0 text-[10px]">Default</Badge>}
                       </div>
@@ -1012,11 +1018,9 @@ export default function CustomerDetailPage() {
                         </AlertDialogTrigger>
                         <AlertDialogContent>
                           <AlertDialogHeader>
-                            <AlertDialogTitle>Remove this payment method?</AlertDialogTitle>
+                            <AlertDialogTitle>Remove {cardLabel(pm)}?</AlertDialogTitle>
                             <AlertDialogDescription>
-                              {paymentMethods.length === 1
-                                ? `${(pm.card_brand || 'Card').charAt(0).toUpperCase() + (pm.card_brand || 'card').slice(1)} ····${pm.card_last4 || '????'} will be detached in Stripe and removed from this customer. After this the customer will have no payment method on file — new invoices won't be auto-charged: they'll be flagged for attention and the customer will be emailed a link to add a card. Billing resumes automatically once a new card is added.`
-                                : `${(pm.card_brand || 'Card').charAt(0).toUpperCase() + (pm.card_brand || 'card').slice(1)} ····${pm.card_last4 || '????'} will be detached in Stripe and removed from this customer. Any subscriptions billing against it will fall back to the new default (if any) on next charge.`}
+                              {removeCardSentence({ onlyCard: paymentMethods.length === 1, isDefault: pm.is_default })}
                             </AlertDialogDescription>
                           </AlertDialogHeader>
                           <AlertDialogFooter>
@@ -1288,8 +1292,10 @@ export default function CustomerDetailPage() {
           onClose={() => setShowNewInvoice(false)}
           onCreated={({ invoice, result }) => {
             setShowNewInvoice(false)
-            queryClient.invalidateQueries({ queryKey: ['customer-overview', id] })
-            queryClient.invalidateQueries({ queryKey: ['invoices'] })
+            // Finalizing (Save & send) applies the customer's credit to the
+            // invoice, so the credit balance, the commit/promo split and the
+            // outstanding total all move: refresh every money surface.
+            invalidateMoneySurfaces(queryClient, { customerId: id, invoiceId: invoice.id })
             showOutcome(newInvoiceOutcome(invoice.invoice_number, result), {
               label: 'View invoice',
               onClick: () => navigate(`/invoices/${invoice.id}`),
