@@ -2520,7 +2520,7 @@ func (e *Engine) handleTrialState(ctx context.Context, sub domain.Subscription, 
 			// CAPTURED for the post-commit finalize below — discarding it
 			// left day-1 invoices durable but never tax-committed, audited,
 			// or auto-charged (spec-verifier catch, ADR-069 item 8).
-			inv, ok, billErr := e.BillOnCreateTx(ctx, tx, activated)
+			inv, ok, billErr := e.BillOnCreateTx(ctx, tx, activated, now)
 			if billErr != nil {
 				return billErr
 			}
@@ -3209,10 +3209,9 @@ func (e *Engine) billOnePeriod(ctx context.Context, sub domain.Subscription) (bo
 	//     not at advance-end frozen_time. Multi-period catchup now
 	//     produces one invoice per cycle with its own period-correct
 	//     timestamp instead of all invoices sharing advance-end.
-	//   - Pause auto-resume gate evaluates at cycle close: a pause
-	//     scheduled to resume mid-cycle is honored — the May 1 cycle
-	//     does NOT bill if pause resumes May 5, even when the advance
-	//     lands at May 20. Industry parity (Stripe, Lago, Orb).
+	//   - The pause is read at the cycle close: the period ending May 1
+	//     stays a draft when the pause resumes May 5, even when the
+	//     close runs May 20.
 	//   - Trial-end activation stamps `activated_at` at the cycle's
 	//     own boundary instead of advance-end.
 	//   - Cancel-at-period-end / scheduled-change applications stamp
@@ -3240,16 +3239,13 @@ func (e *Engine) billOnePeriod(ctx context.Context, sub domain.Subscription) (bo
 		ctx = clock.WithSim(ctx, clock.Sim{At: now, TestClockID: sim.TestClockID})
 	}
 
-	// Pause auto-resume is no longer evaluated here — it now runs as a
-	// dedicated phase BEFORE this loop (Scheduler.pauseResumer for
-	// wall-clock, testclock orchestrator Phase 0.7 for clock-pinned).
-	// That phase clears pause_collection at resumes_at directly,
-	// matching Stripe-parity "resume AT resumes_at" semantics; by the
-	// time we reach this code the pause has either already been
-	// cleared or it's still genuinely in force. The old in-cycle gate
-	// silently leaked any sub whose next_billing_at was further out
-	// than resumes_at — first surfaced by a test-clock advance past
-	// resumes_at on a sub whose cycle wasn't due. See ADR-038.
+	// The pause is cleared by the scheduled resumers, not here
+	// (Scheduler.pauseResumer for wall-clock, the test-clock catchup's
+	// resume phase for clock-pinned subs). They run after the billing
+	// run and never clear a pause while a period ending before
+	// resumes_at is still unclosed, so the row still holds the pause
+	// this close must read; the finalization gate below reads it as of
+	// `now`, the period's end.
 
 	// Apply any scheduled plan changes due at this cycle boundary before
 	// reading plans (see applyDueScheduledPlanChanges).
@@ -3383,9 +3379,10 @@ func (e *Engine) billOnePeriod(ctx context.Context, sub domain.Subscription) (bo
 	// Single source of truth for the draft/finalized decision —
 	// shared across all four invoice-emitting paths (cycle close,
 	// BillOnCreate, BillFinalOnImmediateCancel, handleItemProration).
-	// Encodes: tax pending → draft; pause_collection set → draft;
-	// otherwise finalized. See domain.InvoiceFinalizationStatus.
-	invStatus := domain.InvoiceFinalizationStatus(taxApp.TaxStatus, sub.PauseCollection)
+	// Encodes: tax pending → draft; collection paused at the period's
+	// end → draft; otherwise finalized. See
+	// domain.InvoiceFinalizationStatus.
+	invStatus := domain.InvoiceFinalizationStatus(taxApp.TaxStatus, sub.PauseCollection, now)
 
 	// ADR-031: when ANY plan on the sub is in_advance, the cycle
 	// invoice's header period shifts to the UPCOMING period. The base
@@ -3586,7 +3583,7 @@ func (e *Engine) BillOnCreate(ctx context.Context, sub domain.Subscription) (dom
 	)
 	defer span.End()
 
-	inv, lineItems, ok, err := e.buildOnCreateInvoice(ctx, sub)
+	inv, lineItems, ok, err := e.buildOnCreateInvoice(ctx, sub, e.effectiveNow(ctx, sub))
 	if err != nil {
 		return domain.Invoice{}, err
 	}
@@ -3648,7 +3645,12 @@ func (e *Engine) nextInvoiceNumber(ctx context.Context, tx *sql.Tx, tenantID str
 // whole swap back rather than silently dropping the new in_advance period.
 // Returns ok=false (nil error) for the no-op cases (no in_advance items / zero
 // subtotal) and for an idempotent-skip on the period-uniqueness constraint.
-func (e *Engine) BillOnCreateTx(ctx context.Context, tx *sql.Tx, sub domain.Subscription) (domain.Invoice, bool, error) {
+//
+// startAt is the instant the billed period began for this subscription: the
+// trial end on a trial flip, the request's now on create, activate, early
+// trial end and plan swap. The pause is read as it stood then, because a trial
+// flip can run after resumes_at for a period that began while still paused.
+func (e *Engine) BillOnCreateTx(ctx context.Context, tx *sql.Tx, sub domain.Subscription, startAt time.Time) (domain.Invoice, bool, error) {
 	ctx, span := telemetry.Tracer("billing").Start(ctx, "billing.BillOnCreateTx",
 		trace.WithAttributes(
 			attribute.String("subscription_id", sub.ID),
@@ -3657,7 +3659,7 @@ func (e *Engine) BillOnCreateTx(ctx context.Context, tx *sql.Tx, sub domain.Subs
 	)
 	defer span.End()
 
-	inv, lineItems, ok, err := e.buildOnCreateInvoice(ctx, sub)
+	inv, lineItems, ok, err := e.buildOnCreateInvoice(ctx, sub, startAt)
 	if err != nil {
 		return domain.Invoice{}, false, err
 	}
@@ -3700,7 +3702,8 @@ func (e *Engine) BillOnCreateTx(ctx context.Context, tx *sql.Tx, sub domain.Subs
 // coordinator tx) and finalizes. Returns ok=false (nil error) for the no-op
 // cases: inactive sub, no in_advance items, or zero subtotal. The returned
 // invoice has no InvoiceNumber and carries CreatedAt == effective-now.
-func (e *Engine) buildOnCreateInvoice(ctx context.Context, sub domain.Subscription) (domain.Invoice, []domain.InvoiceLineItem, bool, error) {
+// startAt is the instant the pause is read at (see BillOnCreateTx).
+func (e *Engine) buildOnCreateInvoice(ctx context.Context, sub domain.Subscription, startAt time.Time) (domain.Invoice, []domain.InvoiceLineItem, bool, error) {
 	if sub.Status != domain.SubscriptionActive {
 		return domain.Invoice{}, nil, false, nil
 	}
@@ -3825,7 +3828,7 @@ func (e *Engine) buildOnCreateInvoice(ctx context.Context, sub domain.Subscripti
 		// Pre-fix this path hardcoded Finalized regardless of tax;
 		// invoices with tax_status=pending finalized with
 		// TaxAmountCents=0, lying about authoritative amounts.
-		Status:        domain.InvoiceFinalizationStatus(taxApp.TaxStatus, sub.PauseCollection),
+		Status:        domain.InvoiceFinalizationStatus(taxApp.TaxStatus, sub.PauseCollection, startAt),
 		PaymentStatus: domain.PaymentPending,
 		Currency:      invoiceCurrency,
 		SubtotalCents: taxApp.SubtotalCents,
@@ -4542,7 +4545,7 @@ func (e *Engine) billFinalOnImmediateCancelImpl(ctx context.Context, tx *sql.Tx,
 		// Pre-fix this path hardcoded Finalized regardless of tax;
 		// invoices with tax_status=pending finalized with
 		// TaxAmountCents=0, lying about authoritative amounts.
-		Status:        domain.InvoiceFinalizationStatus(taxApp.TaxStatus, sub.PauseCollection),
+		Status:        domain.InvoiceFinalizationStatus(taxApp.TaxStatus, sub.PauseCollection, canceledAt),
 		PaymentStatus: domain.PaymentPending,
 		Currency:      invoiceCurrency,
 		SubtotalCents: taxApp.SubtotalCents,

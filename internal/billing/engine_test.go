@@ -1573,7 +1573,7 @@ func TestBillOnCreateTx_PricesNewPlanOverNewPeriod(t *testing.T) {
 		Items:                     []domain.SubscriptionItem{{ID: "si_1", PlanID: "p_m_adv", Quantity: 1}},
 	}
 
-	inv, ok, err := engine.BillOnCreateTx(context.Background(), nil, prospective)
+	inv, ok, err := engine.BillOnCreateTx(context.Background(), nil, prospective, now)
 	if err != nil {
 		t.Fatalf("BillOnCreateTx: %v", err)
 	}
@@ -3116,8 +3116,8 @@ func TestRunCycle_PauseCollection_GeneratesDraft(t *testing.T) {
 
 // Auto-resume of pause_collection is no longer evaluated inside the
 // engine cycle scan — the scheduler runs Service.ProcessExpiredPause-
-// Collections as a dedicated phase BEFORE the cycle scan now (the
-// catchup orchestrator does the equivalent at Phase 0.7). The old
+// Collections as a dedicated phase AFTER the cycle scan now (the
+// catchup orchestrator does the equivalent at Phase 1.2). The old
 // in-cycle gate test (TestRunCycle_PauseCollection_AutoResumesWhen-
 // ResumesAtPasses) has been removed; the new contract is covered by
 // service-level tests in the subscription package.
