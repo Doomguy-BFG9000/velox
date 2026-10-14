@@ -8,6 +8,11 @@
  * OpenAPI spec version: 2026-04-07
  */
 
-export type PostV1MembersInviteBody = {
-  email: string;
+export type RotateApiKeyBody = {
+  /**
+     * Grace period for the old key. 0 revokes it immediately.
+     * @minimum 0
+     * @maximum 604800
+     */
+  expires_in_seconds?: number;
 };

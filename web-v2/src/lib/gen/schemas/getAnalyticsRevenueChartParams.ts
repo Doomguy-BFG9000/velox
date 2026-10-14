@@ -7,10 +7,11 @@
  *
  * OpenAPI spec version: 2026-04-07
  */
+import type { AnalyticsPeriod } from './analyticsPeriod';
 
-export type GetV1Members200MembersItem = {
-  user_id: string;
-  email: string;
-  role: string;
-  joined_at: string;
+export type GetAnalyticsRevenueChartParams = {
+/**
+ * The window. Any other value is treated as `30d`. `12m` is 365 days.
+ */
+period?: AnalyticsPeriod;
 };

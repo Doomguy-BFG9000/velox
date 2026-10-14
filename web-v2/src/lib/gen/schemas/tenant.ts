@@ -7,10 +7,12 @@
  *
  * OpenAPI spec version: 2026-04-07
  */
-import type { GetV1Members200MembersItem } from './getV1Members200MembersItem';
-import type { MemberInvitation } from './memberInvitation';
+import type { TenantStatus } from './tenantStatus';
 
-export type GetV1Members200 = {
-  members: GetV1Members200MembersItem[];
-  invitations: MemberInvitation[];
-};
+export interface Tenant {
+  id: string;
+  name: string;
+  status: TenantStatus;
+  created_at: string;
+  updated_at: string;
+}

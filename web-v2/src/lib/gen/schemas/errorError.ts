@@ -7,11 +7,20 @@
  *
  * OpenAPI spec version: 2026-04-07
  */
-import type { ErrorErrorType } from './errorErrorType';
 
 export type ErrorError = {
-  type?: ErrorErrorType;
+  /**
+     * One of `invalid_request_error`, `authentication_error`,
+     * `rate_limit_error` or `api_error`, except when the
+     * `Idempotency-Key` header is the problem: then it is
+     * `idempotency_error`, `conflict_idempotency`,
+     * `conflict_idempotency_unresolved` or `bad_request`. Idempotency errors
+     * have only `type` and `message`. See docs/api-surface.md.
+     */
+  type?: string;
   code?: string;
   message?: string;
   request_id?: string;
+  /** The request field the error is about. Sent only when the error names one. */
+  param?: string;
 };
