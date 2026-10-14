@@ -6,9 +6,12 @@ import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { api, setActiveCurrency, setTenantTimezone, formatCents, formatTaxRate, type StripeProviderCredentials } from '@/lib/api'
+import { ApiError, api, setActiveCurrency, setTenantTimezone, formatTaxRate, type StripeProviderCredentials } from '@/lib/api'
 import { applyApiError, showApiError } from '@/lib/formErrors'
+import { taxExampleAmounts } from '@/lib/taxExample'
+import { SETTINGS_FIELDS, firstInvalidSettingsField, invalidSettingsToast } from '@/lib/settingsFields'
 import { Layout } from '@/components/Layout'
+import { LoadError } from '@/components/LoadError'
 import { useAuth } from '@/contexts/AuthContext'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
@@ -47,9 +50,10 @@ import {
   postalPlaceholderForCountry,
 } from '@/lib/geo'
 
-import { Building2, CreditCard, FileText, Receipt, Check, AlertCircle, Loader2, Trash2, Copy, ExternalLink, X, Users } from 'lucide-react'
+import { Building2, CreditCard, FileText, Receipt, Check, AlertCircle, Info, Loader2, Trash2, Copy, ExternalLink, X, Users } from 'lucide-react'
 import { TeamTab } from '@/components/TeamTab'
 import { CONTENT_BAND } from '@/lib/contentBand'
+import { useStickyActionBar } from '@/hooks/useStickyActionBar'
 
 const settingsSchema = z.object({
   company_name: z.string().max(255, 'Must be at most 255 characters'),
@@ -69,9 +73,13 @@ const settingsSchema = z.object({
   invoice_prefix: z.string()
     .max(20, 'Must be at most 20 characters')
     .regex(/^[A-Z0-9-]*$/, 'Letters, numbers, and hyphens only'),
-  net_payment_terms: z.number().min(0).max(365),
+  net_payment_terms: z.number({ error: 'Enter a number of days from 0 to 365' })
+    .min(0, 'Enter a number of days from 0 to 365')
+    .max(365, 'Enter a number of days from 0 to 365'),
   tax_provider: z.enum(['none', 'manual', 'stripe_tax']),
-  tax_rate: z.number().min(0).max(100),
+  tax_rate: z.number({ error: 'Enter a rate from 0 to 100' })
+    .min(0, 'Enter a rate from 0 to 100')
+    .max(100, 'Enter a rate from 0 to 100'),
   tax_name: z.string().max(50, 'Must be at most 50 characters'),
   tax_inclusive: z.boolean(),
   default_product_tax_code: z.string()
@@ -147,7 +155,7 @@ function LogoPreview({ url }: { url: string }) {
 export default function SettingsPage() {
   usePageTitle('Settings')
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<unknown>(null)
   const [saving, setSaving] = useState(false)
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -169,6 +177,7 @@ export default function SettingsPage() {
 
   const form = watch()
   const hasChanges = isDirty
+  useStickyActionBar(hasChanges)
 
   useEffect(() => {
     const handleBeforeUnload = (e: BeforeUnloadEvent) => {
@@ -204,10 +213,35 @@ export default function SettingsPage() {
       }
       reset(f)
       setLoading(false)
-    }).catch(err => { setError(err instanceof Error ? err.message : 'Failed to load settings'); setLoading(false) })
+    }).catch(err => { setError(err ?? new Error('Failed to load settings')); setLoading(false) })
   }
 
   useEffect(() => { loadSettings() }, [])
+
+  // Tab values: 'general' is the default home; 'business' is accepted
+  // as a back-compat alias since older bookmarks / external links
+  // (docs, support emails) point at ?tab=business.
+  const tab = ((): 'general' | 'invoicing' | 'tax' | 'payments' | 'team' => {
+    const q = searchParams.get('tab')
+    if (q === 'invoicing' || q === 'tax' || q === 'payments' || q === 'team') return q
+    if (q === 'business') return 'general'
+    return 'general'
+  })()
+  const setTab = (t: string) => setSearchParams(t === 'general' ? {} : { tab: t })
+
+  // Only the open tab is rendered, so an invalid field on another tab gave
+  // no sign at all: Save did nothing. Open that tab, focus the field and
+  // say what to fix. Runs for the form's own checks and, after a refused
+  // save, for a field the server named.
+  const showInvalidField = (errors: Parameters<typeof firstInvalidSettingsField>[0]) => {
+    const f = firstInvalidSettingsField(errors)
+    if (!f) return false
+    if (f.tab !== tab) setTab(f.tab)
+    setTimeout(() => formMethods.setFocus(f.field as keyof SettingsFormData), 0)
+    const t = invalidSettingsToast(f)
+    toast.error(t.title, { description: t.description })
+    return true
+  }
 
   const handleSave = handleSubmit(async (data) => {
     setSaving(true)
@@ -261,8 +295,12 @@ export default function SettingsPage() {
         'invoice_prefix', 'net_payment_terms', 'tax_provider', 'tax_rate', 'tax_name', 'tax_inclusive',
         'default_product_tax_code', 'default_currency', 'timezone',
       ], { toastTitle: 'Failed to save settings' })
+      // applyApiError marks a field the server named; if that field is on
+      // another tab, take the operator to it.
+      const named = err instanceof ApiError ? SETTINGS_FIELDS.find(f => f.field === err.field) : undefined
+      if (named && named.tab !== tab) setTab(named.tab)
     } finally { setSaving(false) }
-  })
+  }, errors => { showInvalidField(errors) })
 
   if (loading) return (
     <Layout>
@@ -276,10 +314,7 @@ export default function SettingsPage() {
   if (error) return (
     <Layout>
       <h1 className="text-2xl font-semibold text-foreground">Settings</h1>
-      <div className="mt-6 p-8 text-center">
-        <p className="text-sm text-destructive mb-3">{error}</p>
-        <Button variant="outline" size="sm" onClick={loadSettings}>Retry</Button>
-      </div>
+      <LoadError what="settings" error={error} onRetry={loadSettings} className="mt-6" />
     </Layout>
   )
 
@@ -293,16 +328,6 @@ export default function SettingsPage() {
   const suggestedTaxName = form.company_country ? DEFAULT_TAX_NAME_BY_COUNTRY[form.company_country] : undefined
   const typicalRate = form.company_country ? TYPICAL_TAX_RATE_BY_COUNTRY[form.company_country] : undefined
 
-  // Tab values: 'general' is the default home; 'business' is accepted
-  // as a back-compat alias since older bookmarks / external links
-  // (docs, support emails) point at ?tab=business.
-  const tab = ((): 'general' | 'invoicing' | 'tax' | 'payments' | 'team' => {
-    const q = searchParams.get('tab')
-    if (q === 'invoicing' || q === 'tax' || q === 'payments' || q === 'team') return q
-    if (q === 'business') return 'general'
-    return 'general'
-  })()
-  const setTab = (t: string) => setSearchParams(t === 'general' ? {} : { tab: t })
 
   const countryOptions = COUNTRIES.map(([code, name]) => ({
     value: code,
@@ -585,10 +610,12 @@ export default function SettingsPage() {
                     <div className="relative mt-2 max-w-[160px]">
                       <Input type="number" min={0} max={365}
                         {...register('net_payment_terms', { valueAsNumber: true })}
-                        className="pr-14" />
+                        className={cn('pr-14', formErrors.net_payment_terms && 'border-destructive')} />
                       <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground pointer-events-none">days</span>
                     </div>
-                    <p className="text-xs text-muted-foreground mt-1.5">Days after issue before payment is due</p>
+                    {formErrors.net_payment_terms
+                      ? <p className="text-xs text-destructive mt-1.5">{formErrors.net_payment_terms.message}</p>
+                      : <p className="text-xs text-muted-foreground mt-1.5">Days after issue before payment is due</p>}
                   </div>
                   <div>
                     <Label htmlFor="settings-credit-balance-low-threshold">Credit low-balance alert</Label>
@@ -596,7 +623,10 @@ export default function SettingsPage() {
                       <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground pointer-events-none">{symbol}</span>
                       <Input id="settings-credit-balance-low-threshold" inputMode="decimal"
                         {...register('credit_balance_low_threshold')}
-                        className={cn('pl-7', formErrors.credit_balance_low_threshold && 'border-destructive')}
+                        className={cn(formErrors.credit_balance_low_threshold && 'border-destructive')}
+                        // The prefix runs from "$" to "CA$": pad by its length
+                        // so the value and placeholder start after it.
+                        style={{ paddingLeft: `calc(0.75rem + ${symbol.length}ch + 0.25rem)` }}
                         placeholder="Off" />
                     </div>
                     {formErrors.credit_balance_low_threshold
@@ -739,10 +769,12 @@ export default function SettingsPage() {
                           <Input type="number" step="0.0001" min={0} max={100}
                             value={form.tax_rate}
                             onChange={e => setValue('tax_rate', parseFloat(e.target.value || '0'), { shouldDirty: true })}
-                            className="pr-8" placeholder="0" />
+                            className={cn('pr-8', formErrors.tax_rate && 'border-destructive')} placeholder="0" />
                           <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm text-muted-foreground pointer-events-none">%</span>
                         </div>
-                        {typicalRate !== undefined && Math.abs(form.tax_rate - typicalRate) > 0.01 ? (
+                        {formErrors.tax_rate ? (
+                          <p className="text-xs text-destructive mt-1">{formErrors.tax_rate.message}</p>
+                        ) : typicalRate !== undefined && Math.abs(form.tax_rate - typicalRate) > 0.01 ? (
                           <p className="text-xs text-muted-foreground mt-1">
                             Typical in {COUNTRY_NAME[form.company_country] || form.company_country}:{' '}
                             <button
@@ -772,25 +804,29 @@ export default function SettingsPage() {
                         className="shrink-0 mt-0.5"
                       />
                     </div>
-                    {form.tax_rate > 0 && (
-                      <div className="mt-4 p-3 bg-amber-50 dark:bg-amber-500/10 border border-amber-100 dark:border-amber-500/20 rounded-lg">
-                        <p className="text-xs text-amber-800 dark:text-amber-300 flex items-start gap-2">
-                          <AlertCircle size={14} className="shrink-0 mt-0.5" />
+                    {/* A worked example, not a warning: plain helper text.
+                        Hidden while the rate is out of range: the field shows
+                        the error, and an example at 150% would be nonsense. */}
+                    {form.tax_rate > 0 && form.tax_rate <= 100 && !formErrors.tax_rate && (() => {
+                      const ex = taxExampleAmounts(form.tax_rate, form.tax_inclusive, form.default_currency || 'USD')
+                      return (
+                        <p className="mt-4 text-xs text-muted-foreground flex items-start gap-2">
+                          <Info size={14} className="shrink-0 mt-0.5" aria-hidden />
                           {form.tax_inclusive ? (
                             <span>
-                              Example: {symbol}100.00 sticker price includes {form.tax_name || 'tax'} at {formatTaxRate(form.tax_rate)}%.
-                              Net subtotal = <strong>{formatCents(Math.round(10000 * 10000 / (10000 + form.tax_rate * 100)), form.default_currency || 'USD')}</strong>.
-                              Customer pays <strong>{formatCents(10000, form.default_currency || 'USD')}</strong>.
+                              Example: {ex.base} sticker price includes {form.tax_name || 'tax'} at {formatTaxRate(form.tax_rate)}%.
+                              Net subtotal = <strong className="text-foreground">{ex.net}</strong>.
+                              Customer pays <strong className="text-foreground">{ex.total}</strong>.
                             </span>
                           ) : (
                             <span>
-                              Example: {symbol}100.00 subtotal {form.tax_name ? `+ ${form.tax_name} ` : '+ tax '}
-                              {formatTaxRate(form.tax_rate)}% = <strong>{formatCents(10000 + Math.round(10000 * (form.tax_rate * 100) / 10000), form.default_currency || 'USD')}</strong> total.
+                              Example: {ex.base} subtotal {form.tax_name ? `+ ${form.tax_name} ` : '+ tax '}
+                              {formatTaxRate(form.tax_rate)}% = <strong className="text-foreground">{ex.total}</strong> total.
                             </span>
                           )}
                         </p>
-                      </div>
-                    )}
+                      )
+                    })()}
                   </>
                 )}
 
@@ -858,15 +894,12 @@ export default function SettingsPage() {
         </div>
       </Tabs>
 
-      {/* Sticky save bar. pr-44 reserves the right edge so the Save button
-          doesn't sit under the OnboardingLauncher pill (also fixed
-          bottom-right, z-30), keeping both accessible side-by-side. The
-          geometry is self-evident; a previous version of this comment also
-          claimed "Stripe/Linear use the same right-edge-reserve pattern",
-          which an anchoring pass could find no citable documentation for —
-          removed rather than left as an unsourced parity assertion. */}
+      {/* Sticky save bar. The onboarding pill (also fixed bottom-right,
+          z-30) hides while it shows (useStickyActionBar); a reserved right
+          edge left the bar too narrow at phone width and the pill still
+          covered Save Changes. */}
       {hasChanges && (
-        <div className="fixed bottom-0 left-0 right-0 z-30 md:left-60 pr-44">
+        <div className="fixed bottom-0 left-0 right-0 z-30 md:left-60">
           <div className={cn(CONTENT_BAND, 'px-4 md:px-8')}>
             <div className="bg-card border-t border-border shadow-[0_-4px_12px_rgba(0,0,0,0.05)] rounded-t-xl px-6 py-3 flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -915,7 +948,7 @@ function PaymentsSection() {
   const queryClient = useQueryClient()
   const { user } = useAuth()
   const livemode = user?.livemode ?? false
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ['stripe-credentials'],
     queryFn: () => api.listStripeCredentials(),
   })
@@ -942,7 +975,7 @@ function PaymentsSection() {
       {isLoading ? (
         <Card><CardContent className="p-6 flex justify-center"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></CardContent></Card>
       ) : error ? (
-        <Card><CardContent className="p-6"><p className="text-sm text-destructive">{error instanceof Error ? error.message : 'Failed to load Stripe credentials'}</p></CardContent></Card>
+        <Card><CardContent className="p-0"><LoadError what="Stripe credentials" error={error} onRetry={() => refetch()} /></CardContent></Card>
       ) : (
         <StripeCard
           key={livemode ? 'live' : 'test'}

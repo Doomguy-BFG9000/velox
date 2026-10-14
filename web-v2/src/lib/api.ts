@@ -1,4 +1,5 @@
 import { setLastRequestId } from './lastRequestId'
+import { reportUnauthorized } from './sessionEnd'
 import { getCurrencySymbol } from './money'
 // Recipe wire types are GENERATED from api/openapi.yaml (single source of
 // truth) — the hand-written versions drifted from the server (`key` vs
@@ -22,13 +23,17 @@ export class ApiError extends Error {
   field?: string
   code?: string
   requestId?: string
-  constructor(message: string, status: number, opts?: { field?: string; code?: string; requestId?: string }) {
+  // method is set only when no response arrived (status 0): a POST that got
+  // no answer may still have taken effect, a GET did nothing.
+  method?: string
+  constructor(message: string, status: number, opts?: { field?: string; code?: string; requestId?: string; method?: string }) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.field = opts?.field
     this.code = opts?.code
     this.requestId = opts?.requestId
+    this.method = opts?.method
   }
 }
 
@@ -72,6 +77,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 40_000
 export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const method = (init.method || 'GET').toUpperCase()
   try {
     return await fetch(url, { ...init, signal: controller.signal })
   } catch (e) {
@@ -79,8 +85,14 @@ export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs
       throw new ApiError(
         `Request timed out after ${Math.round(timeoutMs / 1000)}s — the server didn't respond. Check the API is running and reachable, then retry.`,
         0,
-        { code: 'timeout' },
+        { code: 'timeout', method },
       )
+    }
+    // fetch rejects with a TypeError when no response arrives ("Failed to
+    // fetch"). Carrying the method lets the error toast tell an action that
+    // may have gone through from a load that did nothing.
+    if (e instanceof TypeError) {
+      throw new ApiError(e.message, 0, { code: 'network', method })
     }
     throw e
   } finally {
@@ -117,6 +129,9 @@ export async function apiRequest<T>(method: string, path: string, body?: unknown
     const raw = typeof err.error === 'string' ? err.error : (detail?.message || `HTTP ${res.status}`)
     const requestId = detail?.request_id || headerRequestId || undefined
     if (requestId) setLastRequestId(requestId)
+    // A 401 may mean the session ended; the auth provider checks and, if
+    // so, sends the operator to sign-in (lib/sessionEnd).
+    if (res.status === 401) reportUnauthorized(path)
     throw new ApiError(humanizeError(raw), res.status, {
       field: detail?.param || undefined,
       code: detail?.code || undefined,

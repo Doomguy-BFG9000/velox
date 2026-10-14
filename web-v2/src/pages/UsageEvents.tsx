@@ -4,11 +4,13 @@ import { useQuery } from '@tanstack/react-query'
 import { api, formatDateTime } from '@/lib/api'
 import { CustomerCombobox } from '@/components/CustomerCombobox'
 import { startOfDayInTZ, endOfDayInTZ, civilDateAgo } from '@/lib/dates'
-import { RANGES, RANGE_KEYS, DEFAULT_RANGE, parseRange, rangeCaption, resolveWindow } from '@/lib/usageRange'
+import { RANGES, RANGE_KEYS, DEFAULT_RANGE, EXPORT_MAX_ROWS, exportCapNotice, parseRange, rangeCaption, resolveWindow, usageEmptyKind, needsAnyEventCheck } from '@/lib/usageRange'
 import type { Customer, Meter, UsageEvent, UsageEventsAggregate } from '@/lib/api'
 import { downloadCSV } from '@/lib/csv'
 import { showApiError } from '@/lib/formErrors'
 import { Layout } from '@/components/Layout'
+import { LoadError } from '@/components/LoadError'
+import { toast } from 'sonner'
 import { TestClockBadge } from '@/components/TestClockBadge'
 import { cn } from '@/lib/utils'
 
@@ -65,7 +67,7 @@ export default function UsageEventsPage() {
   const [events, setEvents] = useState<UsageEvent[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<unknown>(null)
   const [exporting, setExporting] = useState(false)
 
   // Fetch only the customers referenced by visible events (avoids the
@@ -140,7 +142,7 @@ export default function UsageEventsPage() {
     const params = parts.join('&')
     api.listUsageEvents(params)
       .then(res => { setEvents(res.data || []); setTotal(res.total || 0); setLoading(false) })
-      .catch(err => { setError(err instanceof Error ? err.message : 'Failed to load usage events'); setEvents([]); setTotal(0); setLoading(false) })
+      .catch(err => { setError(err ?? new Error('Failed to load usage events')); setEvents([]); setTotal(0); setLoading(false) })
   }, [page, filterQs])
 
   useEffect(() => { loadEvents() }, [loadEvents])
@@ -153,6 +155,22 @@ export default function UsageEventsPage() {
     queryKey: ['usage-events-aggregate', filterQs],
     queryFn: () => api.aggregateUsageEvents(filterQs || undefined),
   })
+
+  // Empty page under a time window: does the workspace have any event at
+  // all? Decides "No usage events yet" (set up a meter) against "No events
+  // match these filters". Sent only once the windowed list came back empty,
+  // with no filters, so a busy workspace never pays for it; the list's
+  // total makes this one request count the workspace's events, which on
+  // this path are all older than the window.
+  const filtersForEmpty = { customer: filterCustomer, meter: filterMeter, dim: filterDim }
+  const checkAnyEver = !loading && !error && events.length === 0 && needsAnyEventCheck(range, filtersForEmpty)
+  const { data: anyEver = null, isPending: anyEverPending } = useQuery({
+    queryKey: ['usage-events-any-ever'],
+    queryFn: async () => ((await api.listUsageEvents('limit=1')).data ?? []).length > 0,
+    enabled: checkAnyEver,
+    retry: false,
+  })
+  const emptyKind = usageEmptyKind(range, filtersForEmpty, anyEver)
 
   // `quantity` is wire-encoded as a string (NUMERIC(38, 12)) for decimal
   // precision; coerce to number for display math only. Authoritative
@@ -212,18 +230,21 @@ export default function UsageEventsPage() {
   // EXPORT_MAX_ROWS — the same latent truncation, on a smaller artifact. Use
   // /v1/exports/usage-events.csv (server-side, uncapped, snapshot-consistent)
   // when that matters; wiring this button to it is the obvious follow-up.
+  // When the cap is hit the operator is told (exportCapNotice), using the
+  // filtered total the first page reports.
   const EXPORT_PAGE_SIZE = 1000
-  const EXPORT_MAX_ROWS = 50_000
   const handleExport = async () => {
     setExporting(true)
     try {
       const all: UsageEvent[] = []
       let offset = 0
+      let matching = 0
       while (all.length < EXPORT_MAX_ROWS) {
         const parts = [`limit=${EXPORT_PAGE_SIZE}`, `offset=${offset}`]
         if (filterQs) parts.push(filterQs)
         const res = await api.listUsageEvents(parts.join('&'))
         const batch = res.data || []
+        if (offset === 0) matching = res.total || 0
         all.push(...batch)
         if (batch.length < EXPORT_PAGE_SIZE) break
         offset += EXPORT_PAGE_SIZE
@@ -245,6 +266,8 @@ export default function UsageEventsPage() {
         ev.dimensions && Object.keys(ev.dimensions).length > 0 ? JSON.stringify(ev.dimensions) : '',
       ])
       downloadCSV('usage-events.csv', ['Timestamp', 'Customer', 'Meter', 'Value', 'Dimensions'], rows)
+      const capped = exportCapNotice(matching)
+      if (capped) toast.warning(capped.title, { description: capped.description })
     } catch (err) {
       showApiError(err, 'Export failed')
     } finally {
@@ -349,14 +372,11 @@ export default function UsageEventsPage() {
 
       {error ? (
         <Card className="mt-6">
-          <CardContent className="p-8 text-center">
-            <p className="text-sm text-destructive mb-3">{error}</p>
-            <Button variant="outline" size="sm" onClick={loadEvents}>
-              Retry
-            </Button>
+          <CardContent className="p-0">
+            <LoadError what="usage events" error={error} onRetry={loadEvents} />
           </CardContent>
         </Card>
-      ) : loading ? (
+      ) : loading || (checkAnyEver && anyEverPending) ? (
         <Card className="mt-6">
           <CardContent className="p-0">
             <TableSkeleton columns={4} />
@@ -365,12 +385,25 @@ export default function UsageEventsPage() {
       ) : events.length === 0 ? (
         <Card className="mt-6">
           <CardContent className="p-0">
-            <EmptyState
-              icon={Activity}
-              title="No usage events yet"
-              description="Usage events are how metered activity reaches Velox — send them from your backend via the API. Each event needs a meter to land against."
-              action={{ label: 'Set up a meter', to: '/pricing?tab=meters' }}
-            />
+            {emptyKind === 'none-yet' ? (
+              <EmptyState
+                icon={Activity}
+                title="No usage events yet"
+                description="Usage events are how metered activity reaches Velox — send them from your backend via the API. Each event needs a meter to land against."
+                action={{ label: 'Set up a meter', to: '/pricing?tab=meters' }}
+              />
+            ) : (
+              <EmptyState
+                icon={Activity}
+                title="No events match these filters"
+                description="Try a longer date range or clear the filters."
+                action={{
+                  label: 'Clear filters',
+                  variant: 'outline',
+                  onClick: () => setUrlState({ customer: '', meter: '', dim: '', from: '', to: '', range: 'all', page: '1' }),
+                }}
+              />
+            )}
           </CardContent>
         </Card>
       ) : (

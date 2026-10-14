@@ -80,3 +80,45 @@ test('the caption names the window, and never reads back the word "custom"', () 
     assert.doesNotMatch(rangeCaption(k, noCustom), /custom/i, `caption for ${k} leaks the mode name`)
   }
 })
+
+// An empty page under the default 30-day window said "No usage events yet"
+// to operators whose events were older; and an export over 50,000 rows
+// stopped silently.
+import { usageEmptyKind, needsAnyEventCheck, exportCapNotice } from '../src/lib/usageRange.ts'
+
+test('empty Usage page: the default 30-day window on a workspace with no events says none yet', () => {
+  // The common first-use path: DEFAULT_RANGE, no filters, nothing ever sent.
+  assert.equal(usageEmptyKind(DEFAULT_RANGE, {}, false), 'none-yet')
+  assert.equal(needsAnyEventCheck(DEFAULT_RANGE, {}), true)
+})
+
+test('empty Usage page: older events exist, so the window hides them', () => {
+  assert.equal(usageEmptyKind('30d', {}, true), 'no-match')
+  assert.equal(usageEmptyKind('custom', {}, true), 'no-match')
+})
+
+test('empty Usage page: unproven "none yet" falls back to the claim that is always true', () => {
+  // null: the check is pending or failed.
+  assert.equal(usageEmptyKind('30d', {}, null), 'no-match')
+})
+
+test('empty Usage page: all time with no filters needs no extra request', () => {
+  assert.equal(usageEmptyKind('all', {}, null), 'none-yet')
+  assert.equal(needsAnyEventCheck('all', {}), false)
+})
+
+test('empty Usage page: a customer, meter or dimension filter always reads as no match', () => {
+  assert.equal(usageEmptyKind('all', { meter: 'mtr_1' }, false), 'no-match')
+  assert.equal(usageEmptyKind('30d', { dim: 'model=gpt-4' }, false), 'no-match')
+  assert.equal(usageEmptyKind('30d', { customer: 'cus_1' }, false), 'no-match')
+  assert.equal(needsAnyEventCheck('30d', { customer: 'cus_1' }), false)
+})
+
+test('export cap: a notice only when more events match than the file holds', () => {
+  assert.equal(exportCapNotice(50_000), null)
+  assert.equal(exportCapNotice(12), null)
+  assert.deepEqual(exportCapNotice(73_210), {
+    title: 'Exported the newest 50,000 events',
+    description: '73,210 events match. Export a shorter date range to get the rest.',
+  })
+})

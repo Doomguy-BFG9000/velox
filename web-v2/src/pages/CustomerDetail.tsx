@@ -21,12 +21,14 @@ import { SendSetupLinkDialog } from '@/components/SendSetupLinkDialog'
 import { PriceOverridesCard } from '@/components/PriceOverridesCard'
 import { CostDashboard } from '@/components/CostDashboard'
 import { TestClockBanner } from '@/components/TestClockBanner'
+import { Callout } from '@/components/Callout'
 import { CreateSubscriptionDialog } from '@/components/CreateSubscriptionDialog'
 import { cn } from '@/lib/utils'
 import { customerNeedsPaymentMethod } from '@/lib/paymentReadiness'
 import { statusBadgeVariant } from '@/lib/status'
 
 import { Button } from '@/components/ui/button'
+import { LoadError } from '@/components/LoadError'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -46,7 +48,7 @@ import {
   AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 
-import { Loader2, Pencil, CreditCard, Archive, Wand2, FilePlus2, Plus, Trash2, ChevronDown, ChevronRight, History, AlertTriangle } from 'lucide-react'
+import { Loader2, Pencil, CreditCard, Archive, Wand2, FilePlus2, Plus, Trash2, ChevronDown, ChevronRight, History } from 'lucide-react'
 import { Textarea } from '@/components/ui/textarea'
 import { CopyButton } from '@/components/CopyButton'
 import { DetailBreadcrumb } from '@/components/DetailBreadcrumb'
@@ -429,10 +431,7 @@ export default function CustomerDetailPage() {
   if (error) {
     return (
       <Layout>
-        <div className="py-16 text-center">
-          <p className="text-sm text-destructive mb-3">{error}</p>
-          <Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button>
-        </div>
+        <LoadError what="this customer" error={loadError} onRetry={() => refetch()} className="py-16" />
       </Layout>
     )
   }
@@ -451,7 +450,7 @@ export default function CustomerDetailPage() {
 
       {/* Archived Banner */}
       {isArchived && (
-        <Card className="mb-4 border-amber-200 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-950/20">
+        <Card className="mb-4 ring-amber-200 bg-amber-50 dark:ring-amber-900/50 dark:bg-amber-950/20">
           <CardContent className="px-5 py-3 flex items-center justify-between">
             <p className="text-sm text-amber-800 dark:text-amber-300">This customer has been archived. All data is read-only.</p>
             <Button variant="outline" size="sm"
@@ -468,8 +467,8 @@ export default function CustomerDetailPage() {
       )}
 
       {/* Header */}
-      <div className="flex items-start justify-between mb-6">
-        <div>
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3 mb-6">
+        <div className="min-w-0">
           <div className="flex items-center gap-2">
             <h1 className="text-2xl font-semibold text-foreground">{customer.display_name}</h1>
             {/* Customer-level test-clock attach (ADR-027). Badge on
@@ -481,7 +480,7 @@ export default function CustomerDetailPage() {
             <CopyButton text={customer.id} />
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           {!isArchived && (
             <Button size="sm" onClick={() => setShowNewInvoice(true)}>
               <FilePlus2 size={14} className="mr-1.5" />
@@ -955,17 +954,9 @@ export default function CustomerDetailPage() {
         <CardContent className="p-0">
           {paymentMethods.length === 0 ? (
             needsCard ? (
-              <div className="mx-6 my-4 rounded-lg border border-amber-300 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 px-4 py-3">
-                <div className="flex items-start gap-2.5">
-                  <AlertTriangle size={16} className="text-amber-500 mt-0.5 shrink-0" />
-                  <div>
-                    <p className="text-sm font-medium text-amber-800 dark:text-amber-400">No payment method on file</p>
-                    <p className="text-xs text-amber-700/90 dark:text-amber-500/90 mt-0.5">
-                      This customer has an active subscription that bills automatically. Add a card so renewal charges can be collected — without one, the next invoice will need manual follow-up.
-                    </p>
-                  </div>
-                </div>
-              </div>
+              <Callout tone="amber" className="mx-6 my-4" title="No payment method on file">
+                This customer has an active subscription that bills automatically. Add a card so renewal charges can be collected — without one, the next invoice will need manual follow-up.
+              </Callout>
             ) : (
               <div className="px-6 py-8 text-center">
                 <CreditCard size={28} className="text-muted-foreground mx-auto mb-2" />

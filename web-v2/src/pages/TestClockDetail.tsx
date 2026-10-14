@@ -4,12 +4,14 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 
-import { api, formatDateTime, getTenantTimezone, type TestClock, type AdvanceSummary } from '@/lib/api'
+import { api, ApiError, formatDateTime, getTenantTimezone, type TestClock, type AdvanceSummary } from '@/lib/api'
 import { showApiError } from '@/lib/formErrors'
+import { cn } from '@/lib/utils'
 import { formatInTimeZone, fromZonedTime } from 'date-fns-tz'
 import { Layout } from '@/components/Layout'
 import { DetailSkeleton } from '@/components/ui/DetailSkeleton'
 import { Button } from '@/components/ui/button'
+import { LoadError } from '@/components/LoadError'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
@@ -53,10 +55,13 @@ function LastAdvanceCard({ summary }: { summary: AdvanceSummary }) {
       : `Advanced ${formatDateTime(summary.advanced_from)} → ${formatDateTime(summary.advanced_to)}`
 
   return (
-    <Card className="mt-4 border-amber-300/60 bg-amber-50/60 dark:bg-amber-500/5">
+    // A finished advance is information: neutral card. Amber only when the
+    // advance ended with an error, and then only on the line that says so.
+    // Card draws its edge with ring-1, so the amber edge is a ring colour.
+    <Card className={cn('mt-4', summary.had_errors && 'ring-amber-300 dark:ring-amber-500/40')}>
       <CardContent className="px-6 py-5">
         <div className="flex items-center gap-2">
-          <FastForward size={16} className="text-amber-600" />
+          <FastForward size={16} className="text-muted-foreground" />
           <p className="text-sm font-semibold text-foreground">Last advance results</p>
         </div>
         <p className="mt-1 text-xs text-muted-foreground">{span}</p>
@@ -67,7 +72,9 @@ function LastAdvanceCard({ summary }: { summary: AdvanceSummary }) {
         ) : (
           <dl className="mt-3 grid grid-cols-2 gap-x-8 gap-y-2 sm:grid-cols-3">
             {rows.map(([label, n]) => (
-              <div key={label} className="flex items-baseline justify-between gap-3">
+              // Value right after its label: spread to the cell's edge, a
+              // lone row left its number a column-width away.
+              <div key={label} className="flex items-baseline gap-2">
                 <dt className="text-sm text-muted-foreground">{label}</dt>
                 <dd className="text-sm font-semibold tabular-nums">{n}</dd>
               </div>
@@ -75,7 +82,8 @@ function LastAdvanceCard({ summary }: { summary: AdvanceSummary }) {
           </dl>
         )}
         {summary.had_errors && (
-          <p className="mt-3 text-xs text-amber-700 dark:text-amber-500">
+          <p className="mt-3 flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+            <AlertTriangle size={13} className="mt-0.5 shrink-0" aria-hidden />
             This advance ended with an error — the counts above reflect only the work that
             completed before it failed.
           </p>
@@ -202,17 +210,24 @@ export default function TestClockDetailPage() {
     )
   }
   if (clockQ.error || !clock) {
+    // A 404 is "not found", not a load failure: Retry can't bring a deleted
+    // clock back, so it gets the Back link instead.
+    const notFound = !clockQ.error || (clockQ.error instanceof ApiError && clockQ.error.status === 404)
     return (
       <Layout>
         <Card className="mt-6">
-          <CardContent className="p-8 text-center">
-            <p className="text-sm text-destructive mb-3">
-              {clockQ.error instanceof Error ? clockQ.error.message : 'Test clock not found'}
-            </p>
-            <Link to="/test-clocks">
-              <Button variant="outline" size="sm">Back to Test Clocks</Button>
-            </Link>
-          </CardContent>
+          {!notFound ? (
+            <CardContent className="p-0">
+              <LoadError what="this test clock" error={clockQ.error} onRetry={() => clockQ.refetch()} />
+            </CardContent>
+          ) : (
+            <CardContent className="p-8 text-center">
+              <p className="text-sm text-destructive mb-3">Test clock not found</p>
+              <Link to="/test-clocks">
+                <Button variant="outline" size="sm">Back to Test Clocks</Button>
+              </Link>
+            </CardContent>
+          )}
         </Card>
       </Layout>
     )
@@ -226,15 +241,17 @@ export default function TestClockDetailPage() {
         </Link>
       </div>
 
-      <div className="mt-2 flex items-start justify-between gap-4">
+      {/* Wraps the actions under the title at narrow widths (like the other
+          detail pages) instead of truncating the clock name to fit them. */}
+      <div className="mt-2 flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
         <div className="min-w-0">
-          <div className="flex items-center gap-3">
-            <h1 className="text-2xl font-semibold text-foreground truncate">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <h1 className="text-2xl font-semibold text-foreground break-words min-w-0">
               {clock.name || 'Unnamed clock'}
             </h1>
             <StatusBadge status={clock.status} />
           </div>
-          <p className="text-xs text-muted-foreground font-mono mt-1">{clock.id}</p>
+          <p className="text-xs text-muted-foreground font-mono mt-1 break-all">{clock.id}</p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <Button
@@ -252,7 +269,7 @@ export default function TestClockDetailPage() {
       </div>
 
       {clock.status === 'internal_failure' && (
-        <Card className="mt-4 border-destructive/30 bg-destructive/5">
+        <Card className="mt-4 ring-destructive/30 bg-destructive/5">
           <CardContent className="px-6 py-4 flex items-start gap-3">
             <AlertTriangle size={16} className="text-destructive shrink-0 mt-0.5" />
             <div className="text-sm flex-1 min-w-0">

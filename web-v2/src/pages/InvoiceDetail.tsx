@@ -17,6 +17,7 @@ import { collectOutcome, writeOffOutcome } from '@/lib/actionOutcomes'
 import { showOutcome } from '@/lib/outcomeToast'
 import { InvoiceAttention } from '@/components/InvoiceAttention'
 import { TestClockBanner } from '@/components/TestClockBanner'
+import { Callout } from '@/components/Callout'
 import { useGetInvoice } from '@/lib/gen/queries.gen'
 import type { Invoice } from '@/lib/gen/schemas/invoice'
 import type { InvoiceLineItem as LineItem } from '@/lib/gen/schemas/invoiceLineItem'
@@ -30,6 +31,7 @@ import { cn } from '@/lib/utils'
 import { statusBadgeVariant, creditNoteReasonLabel, paymentIsUnresolved } from '@/lib/status'
 
 import { Button } from '@/components/ui/button'
+import { LoadError } from '@/components/LoadError'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -492,7 +494,10 @@ export default function InvoiceDetailPage() {
     // The returned invoice says what happened — paid outright (card or
     // credit), still confirming, or an outcome recorded during the call.
     onSuccess: (updated) => { invalidateAll(); showOutcome(collectOutcome(updated)) },
-    onError: (err) => showApiError(err, 'Payment failed'),
+    // A refusal means nothing was charged; "Couldn't charge" says that and
+    // no more. No answer (or Stripe never answering) gets "result unknown"
+    // from errorToast, since the card may have been charged.
+    onError: (err) => showApiError(err, "Couldn't charge"),
   })
 
   // No-payment-method nudge: re-send the SAME setup-link email the engine sent
@@ -628,10 +633,7 @@ export default function InvoiceDetailPage() {
   if (error) {
     return (
       <Layout>
-        <div className="py-16 text-center">
-          <p className="text-sm text-destructive mb-3">{error}</p>
-          <Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button>
-        </div>
+        <LoadError what="this invoice" error={loadError} onRetry={() => refetch()} className="py-16" />
       </Layout>
     )
   }
@@ -651,8 +653,8 @@ export default function InvoiceDetailPage() {
       <DetailBreadcrumb to="/invoices" parentLabel="Invoices" currentLabel={invoice.invoice_number} />
 
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
-        <div>
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3 mb-6">
+        <div className="min-w-0">
           <div className="flex items-center gap-2">
             <h1 className="text-2xl font-semibold text-foreground">{invoice.invoice_number}</h1>
           </div>
@@ -680,7 +682,7 @@ export default function InvoiceDetailPage() {
             it as a flat header button preserves the "you're editing
             this draft" affordance. Everything else sits in the
             overflow. */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" size="sm"
             onClick={() => navigate(`/audit-log?resource_type=invoice&resource_id=${invoice.id}`)}>
             <History size={14} className="mr-1.5" />
@@ -908,52 +910,46 @@ export default function InvoiceDetailPage() {
           consequence + the recovery paths so the operator isn't
           left wondering why most buttons disappeared. */}
       {invoice.status === 'uncollectible' && (
-        <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
-          <div className="flex items-start gap-3">
-            <div className="mt-0.5 h-2 w-2 rounded-full bg-amber-500 shrink-0" />
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-medium text-foreground">Marked uncollectible</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                Recorded as bad debt. Dunning automation has halted and no further collection is attempted.
-                The invoice stays on the books for audit. The subscription remains <strong>active</strong> —
-                {' '}{subscription?.id ? (
-                  <Link to={`/subscriptions/${subscription.id}`} className="text-primary hover:underline">cancel it separately</Link>
-                ) : 'cancel it separately'} if you also want to stop future billing.
+        <Callout tone="amber" className="mb-6" title="Marked uncollectible">
+          <p className="text-xs">
+            Recorded as bad debt. Dunning automation has halted and no further collection is attempted.
+            The invoice stays on the books for audit. The subscription remains <strong>active</strong> —
+            {' '}{subscription?.id ? (
+              <Link to={`/subscriptions/${subscription.id}`} className="text-primary hover:underline">cancel it separately</Link>
+            ) : 'cancel it separately'} if you also want to stop future billing.
+          </p>
+          <p className="text-xs pt-1">
+            If the customer pays after all, use <strong>Record Payment</strong> above for money received
+            offline. To collect by card, issue a fresh <strong>recovery invoice</strong> for the amount —
+            it runs on normal rails (hosted payment page, auto-charge once a card is on file) and this
+            invoice stays honestly written off; bad-debt recovery books as new income. A written-off
+            invoice is never charged directly (ADR-113). To reclassify as cancelled rather than
+            written-off, use <strong>Void</strong>.
+          </p>
+          {/* No card on file: offer the secure add-a-card link. The card is
+              account-scoped — it serves the recovery invoice and future
+              billing; nothing charges THIS invoice (ADR-113). The attention
+              banner that normally offers this action returns null for
+              terminal invoices, so it has to live here. */}
+          {invoice.amount_due_cents > 0 && !hasPaymentMethod && (
+            <div className="mt-2 border-l-2 border-border pl-3">
+              <p className="text-xs">
+                <strong className="text-foreground">No payment method on file.</strong>{' '}
+                Email {customer?.display_name || 'the customer'} a secure link to add a card, then
+                collect through a recovery invoice. Adding a card never charges this invoice.
               </p>
-              <p className="text-xs text-muted-foreground mt-2">
-                If the customer pays after all, use <strong>Record Payment</strong> above for money received
-                offline. To collect by card, issue a fresh <strong>recovery invoice</strong> for the amount —
-                it runs on normal rails (hosted payment page, auto-charge once a card is on file) and this
-                invoice stays honestly written off; bad-debt recovery books as new income. A written-off
-                invoice is never charged directly (ADR-113). To reclassify as cancelled rather than
-                written-off, use <strong>Void</strong>.
-              </p>
-              {/* No card on file: offer the secure add-a-card link. The card is
-                  account-scoped — it serves the recovery invoice and future
-                  billing; nothing charges THIS invoice (ADR-113). The attention
-                  banner that normally offers this action returns null for
-                  terminal invoices, so it has to live here. */}
-              {invoice.amount_due_cents > 0 && !hasPaymentMethod && (
-                <div className="mt-3 border-l-2 border-border pl-3">
-                  <p className="text-xs text-muted-foreground">
-                    <strong className="text-foreground">No payment method on file.</strong>{' '}
-                    Email {customer?.display_name || 'the customer'} a secure link to add a card, then
-                    collect through a recovery invoice. Adding a card never charges this invoice.
-                  </p>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="mt-2"
-                    disabled={acting || resendSetupLinkMutation.isPending}
-                    onClick={() => resendSetupLinkMutation.mutate()}
-                  >
-                    {resendSetupLinkMutation.isPending ? 'Sending…' : 'Email a payment-method link'}
-                  </Button>
-                </div>
-              )}
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-2"
+                disabled={acting || resendSetupLinkMutation.isPending}
+                onClick={() => resendSetupLinkMutation.mutate()}
+              >
+                {resendSetupLinkMutation.isPending ? 'Sending…' : 'Email a payment-method link'}
+              </Button>
             </div>
-          </div>
-        </div>
+          )}
+        </Callout>
       )}
 
       {/* Unified attention banner — typed reason + prescribed actions

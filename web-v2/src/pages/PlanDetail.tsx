@@ -11,6 +11,7 @@ import { applyApiError, showApiError } from '@/lib/formErrors'
 import { priceRate } from '@/lib/priceDisplay'
 import { meterAggregationLabel } from '@/lib/meterLabels'
 import { Layout } from '@/components/Layout'
+import { LoadError } from '@/components/LoadError'
 import { TestClockBadge } from '@/components/TestClockBadge'
 import { statusBadgeVariant } from '@/lib/status'
 
@@ -177,7 +178,6 @@ export default function PlanDetailPage() {
   }
 
   const loading = isLoading
-  const error = loadError instanceof Error ? loadError.message : loadError ? String(loadError) : null
 
   usePageTitle(plan?.name)
 
@@ -189,13 +189,10 @@ export default function PlanDetailPage() {
     )
   }
 
-  if (error) {
+  if (loadError) {
     return (
       <Layout>
-        <div className="py-16 text-center">
-          <p className="text-sm text-destructive mb-3">{error}</p>
-          <Button variant="outline" size="sm" onClick={() => refetch()}>Retry</Button>
-        </div>
+        <LoadError what="this plan" error={loadError} onRetry={() => refetch()} className="py-16" />
       </Layout>
     )
   }
@@ -213,16 +210,16 @@ export default function PlanDetailPage() {
       <DetailBreadcrumb to="/pricing" parentLabel="Plans" currentLabel={plan.name} />
 
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
-        <div>
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3 mb-6">
+        <div className="min-w-0">
           <h1 className="text-2xl font-semibold text-foreground">{plan.name}</h1>
-          <div className="flex items-center gap-2 mt-1">
+          <div className="flex flex-wrap items-center gap-2 mt-1">
             <span className="text-xs text-muted-foreground font-mono bg-muted px-2 py-0.5 rounded">{plan.id}</span>
             <CopyButton text={plan.id} />
             <span className="text-xs text-muted-foreground font-mono bg-muted px-2 py-0.5 rounded">{plan.code}</span>
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3">
           <Badge variant={statusVariant(plan.status)}>{plan.status}</Badge>
           <Button variant="outline" size="sm" onClick={() => setShowEdit(true)}>
             <Pencil size={14} className="mr-1.5" />
