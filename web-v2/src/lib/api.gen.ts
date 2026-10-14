@@ -4018,7 +4018,8 @@ export interface paths {
          *     request carries — `velox_session` cookie (dashboard) or
          *     `Authorization: Bearer` (SDK / curl). Cookie path returns
          *     `user_id` + `email`; Bearer path returns `key_id` + `key_type`.
-         *     Both always return `tenant_id` + `livemode`.
+         *     Both always return `tenant_id`, `livemode` and
+         *     `can_email_setup_links`.
          */
         get: {
             parameters: {
@@ -4038,6 +4039,13 @@ export interface paths {
                         "application/json": {
                             tenant_id: string;
                             livemode: boolean;
+                            /**
+                             * @description Whether this server can email a customer a link to add
+                             *     a payment method. False when email sending (SMTP) or
+                             *     PAYMENT_UPDATE_URL is not set up; resending a setup
+                             *     link then fails.
+                             */
+                            can_email_setup_links: boolean;
                             user_id?: string;
                             email?: string;
                             key_id?: string;
@@ -6193,7 +6201,12 @@ export interface components {
         /**
          * @description Operator's recommended next step. Closed enum because every
          *     code maps to a concrete server endpoint or frontend route,
-         *     and audit logs key off the code. `void_invoice` is offered only
+         *     and audit logs key off the code. `reconcile_payment` opens the
+         *     payment in Stripe; it is offered on `payment_anomaly`, where the
+         *     refund or correction is made there. `mark_uncollectible` opens
+         *     the write-off and is offered only when a payment's outcome can
+         *     never be identified (payment status unknown with no payment
+         *     intent recorded). `void_invoice` is offered only
          *     on prepaid-commit exposure, and only while some of the granted
          *     credit is still unspent: voiding retires the unspent balance
          *     (ADR-078) and is the sole recovery for an unpaid invoice whose
@@ -6201,7 +6214,7 @@ export interface components {
          *     is never clawed back (2026-08-04).
          * @enum {string}
          */
-        AttentionAction: "edit_billing_profile" | "retry_tax" | "retry_payment" | "wait_provider" | "rotate_api_key" | "reconcile_payment" | "review_registration" | "charge_now" | "send_reminder" | "add_payment_method" | "update_payment_method" | "connect_tax_provider" | "void_invoice";
+        AttentionAction: "edit_billing_profile" | "retry_tax" | "retry_payment" | "wait_provider" | "rotate_api_key" | "reconcile_payment" | "review_registration" | "charge_now" | "send_reminder" | "add_payment_method" | "update_payment_method" | "connect_tax_provider" | "void_invoice" | "mark_uncollectible";
         AttentionActionItem: {
             code: components["schemas"]["AttentionAction"];
             /**
@@ -6222,7 +6235,17 @@ export interface components {
         Attention: {
             severity: components["schemas"]["AttentionSeverity"];
             reason: components["schemas"]["AttentionReason"];
-            /** @description Human-readable headline copy, safe to render verbatim. */
+            /**
+             * @description Human-readable copy, safe to render verbatim: one plain
+             *     sentence saying what happens and what to do. Facts that must
+             *     show up front follow on more lines, separated by a newline
+             *     (`\n`), one sentence each and up to three lines in all: the
+             *     setup-link email on `no_payment_method` (and on
+             *     `dunning_exhausted` when no link can be emailed), and the
+             *     prepaid credit at risk on an unpaid commit invoice. A no-card
+             *     commit invoice carries all three. Wording may change between
+             *     releases; switch on `reason` and `code`, not on this text.
+             */
             message: string;
             /**
              * @description Prescribed next steps. First item is the primary CTA; the
@@ -6249,11 +6272,20 @@ export interface components {
              */
             param?: string;
             /**
-             * @description Raw provider payload (Stripe Tax JSON envelope, last
-             *     payment error message). Disclosed in a collapsible
-             *     section for diagnostic depth.
+             * @description Velox's own explanation behind `message`: why the state
+             *     holds, what Velox does on its own, and ids support may ask
+             *     for (for example the payment intent ids of a payment
+             *     anomaly). Plain text; may contain blank-line paragraph
+             *     breaks. Never a provider payload — that is
+             *     `provider_response`.
              */
             detail?: string;
+            /**
+             * @description The provider's own response (Stripe Tax error envelope,
+             *     Stripe's last payment error), exactly as received. Present
+             *     only when Velox called the provider.
+             */
+            provider_response?: string;
             /**
              * Format: date-time
              * @description When the attention condition started — operators triage
