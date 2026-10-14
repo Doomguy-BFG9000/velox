@@ -15,7 +15,16 @@ Older entries keep their original text.
 
 ## [Unreleased]
 
+**Before upgrading:**
+
+- **Period-end invoices are now built 1 to 2 hours after the period ends** (was within 1 hour), so late usage is billed. Set `INVOICE_GRACE_PERIOD=0` for the old timing. Also later by up to the grace:
+  - `POST /v1/billing/run`: a script that runs it right after a period end sees 0 invoices.
+  - A cancel or plan change scheduled for a date: the subscription stays `active`, and `subscription.canceled` is sent, up to the grace after `cancel_at`. `canceled_at` is still the scheduled date, so give access by `cancel_at` rather than `status` if that matters to you.
+  - An expired credit grant leaves the balance up to the grace after `expires_at`.
+
 ### Added
+
+- **Usage that arrives up to an hour after its period ends is billed: `INVOICE_GRACE_PERIOD` (2026-10-14, #961).** The invoice for an ended period is built once the grace (default `1h`, `0` to `72h`) has passed, for every subscription, flat-fee ones too. Invoice dates stay at the period end; the webhook, charge and dunning come up to that much later. Usage arriving after the invoice is stored, not billed. [ADR-120](docs/adr/120-invoice-grace-period-for-late-usage.md).
 
 - **Try Velox with only Docker: `deploy/compose/quickstart.sh` (2026-10-14, #959).** One command starts Velox from the published release images, writes the four secrets, creates the first login and prints it with a test API key. `./quickstart.sh demo` then runs the demo flow to a finalized invoice, in a container, so Go, Node and `jq` are not needed. It uses its own Compose project name and port 8080, so it does not touch another Velox stack on the same machine. The README quick start now uses it; the from-source setup moved to CONTRIBUTING.
 
