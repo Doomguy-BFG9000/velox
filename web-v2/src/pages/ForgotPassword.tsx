@@ -2,13 +2,15 @@ import { useState } from 'react'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { Link } from 'react-router-dom'
 import { authApi } from '@/lib/auth'
-import { ApiError } from '@/lib/api'
+import { authFormError } from '@/lib/authFormError'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Loader2 } from 'lucide-react'
 import { VeloxLogo } from '@/components/VeloxLogo'
+import { Callout } from '@/components/Callout'
+import { resetSentNotice } from '@/lib/emailOffNotices'
 
 // ForgotPasswordPage is the dashboard's password-reset request flow.
 // Always renders the same "if your email is on file, a reset link
@@ -24,9 +26,11 @@ export default function ForgotPasswordPage() {
   usePageTitle('Reset password')
   const [email, setEmail] = useState('')
   const [submitted, setSubmitted] = useState(false)
-  const [emailNotConfigured, setEmailNotConfigured] = useState(false)
+  const [emailDelivery, setEmailDelivery] = useState<string | undefined>(undefined)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+
+  const notice = resetSentNotice(emailDelivery, email)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -38,14 +42,10 @@ export default function ForgotPasswordPage() {
     setLoading(true)
     try {
       const res = await authApi.requestPasswordReset(email.trim())
-      setEmailNotConfigured(res?.email_delivery === 'not_configured')
+      setEmailDelivery(res?.email_delivery)
       setSubmitted(true)
     } catch (err) {
-      if (err instanceof ApiError) {
-        setError(err.message)
-      } else {
-        setError('Cannot connect to Velox API')
-      }
+      setError(authFormError(err))
     } finally {
       setLoading(false)
     }
@@ -62,20 +62,18 @@ export default function ForgotPasswordPage() {
         <CardContent className="p-6">
           {submitted ? (
             <div className="space-y-4 text-sm">
-              {emailNotConfigured ? (
-                <div className="px-3 py-2.5 rounded-lg bg-amber-500/10 border border-amber-500/20">
-                  <p className="text-foreground font-medium">Email delivery isn&rsquo;t configured on this server</p>
-                  <p className="text-muted-foreground mt-1">
-                    No reset link can be sent. Configure SMTP and <code className="font-mono">DASHBOARD_BASE_URL</code>,
-                    then try again — see <code className="font-mono">docs/ops/email-setup.md</code>.
+              <Callout
+                tone={notice.tone}
+                title={notice.title}
+                details={notice.operatorDetails ? (
+                  <p>
+                    For whoever runs Velox: set <code className="font-mono">SMTP_HOST</code> and{' '}
+                    <code className="font-mono">DASHBOARD_BASE_URL</code> (docs/ops/email-setup.md).
                   </p>
-                </div>
-              ) : (
-                <p className="text-foreground">
-                  If an account exists for <strong>{email}</strong>, we&rsquo;ve sent a password-reset link.
-                  The link expires in 1 hour.
-                </p>
-              )}
+                ) : undefined}
+              >
+                <p>{notice.body}</p>
+              </Callout>
               <Link to="/login">
                 <Button variant="outline" className="w-full">
                   Back to sign in

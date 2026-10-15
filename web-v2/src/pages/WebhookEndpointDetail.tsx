@@ -11,11 +11,23 @@ import { api, type EndpointDelivery } from '@/lib/api'
 // and the events live tail (ADR-030 forensic layer).
 import { timeAgo, timeUntil, wallClockNow } from '@/lib/effectiveNow'
 import { showApiError } from '@/lib/formErrors'
+import { pausedEndpointNotice, isAllEvents } from '@/lib/webhookNotices'
 import { Layout } from '@/components/Layout'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { LoadError } from '@/components/LoadError'
+import { Callout } from '@/components/Callout'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Card, CardContent } from '@/components/ui/card'
 import { EmptyState } from '@/components/EmptyState'
 import { ScrollPane } from '@/components/ui/scroll-pane'
@@ -69,10 +81,32 @@ export default function WebhookEndpointDetailPage() {
   })
 
   const endpoint = data?.endpoint
+  const pausedNotice = pausedEndpointNotice(endpoint?.active)
   const deliveries = data?.data ?? []
   const stats = statsData?.data.find(s => s.endpoint_id === id)
   const completed = stats ? stats.succeeded + stats.failed : 0
   const pendingCount = stats ? stats.total_deliveries - completed : 0
+
+  // Resume used to be reachable only from All endpoints → Edit → Active.
+  // PATCH with just `active` leaves URL, events and secret as they are. The
+  // confirm shows the URL: a recipe-made endpoint starts paused with a
+  // placeholder address, and resuming that would send events to it.
+  const [resuming, setResuming] = useState(false)
+  const [confirmResume, setConfirmResume] = useState(false)
+  const handleResume = async () => {
+    if (!id || resuming) return
+    setResuming(true)
+    try {
+      await api.updateWebhookEndpoint(id, { active: true })
+      toast.success('Endpoint resumed')
+      queryClient.invalidateQueries({ queryKey: ['webhook-endpoint-deliveries', id] })
+      queryClient.invalidateQueries({ queryKey: ['webhook-endpoints'] })
+    } catch (err) {
+      showApiError(err, 'Failed to resume endpoint')
+    } finally {
+      setResuming(false)
+    }
+  }
 
   const handleReplay = async (d: EndpointDelivery) => {
     if (!id || replayInFlight.current) return
@@ -133,10 +167,18 @@ export default function WebhookEndpointDetailPage() {
           {endpoint?.description && (
             <p className="text-sm text-muted-foreground mt-1">{endpoint.description}</p>
           )}
-          {endpoint && !endpoint.active && (
-            <p className="text-sm text-muted-foreground mt-1">
-              Paused — no events are delivered and replays are unavailable until this endpoint is resumed.
-            </p>
+          {pausedNotice && (
+            <Callout
+              className="mt-3"
+              title={pausedNotice.title}
+              actions={
+                <Button size="sm" variant="outline" onClick={() => setConfirmResume(true)} disabled={resuming}>
+                  {resuming ? 'Resuming…' : 'Resume'}
+                </Button>
+              }
+            >
+              <p>{pausedNotice.body}</p>
+            </Callout>
           )}
           {endpoint && (
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-sm text-muted-foreground">
@@ -147,10 +189,9 @@ export default function WebhookEndpointDetailPage() {
                 {pendingCount > 0 && <> {'·'} {pendingCount} pending</>}
               </span>
               <span className="flex flex-wrap gap-1">
-                {(endpoint.events || []).map(ev => (
-                  <Badge key={ev} variant="outline">{ev}</Badge>
-                ))}
-                {(!endpoint.events || endpoint.events.length === 0) && <Badge variant="outline">all events</Badge>}
+                {isAllEvents(endpoint.events)
+                  ? <Badge variant="outline">all events</Badge>
+                  : endpoint.events!.map(ev => <Badge key={ev} variant="outline">{ev}</Badge>)}
               </span>
             </div>
           )}
@@ -202,6 +243,20 @@ export default function WebhookEndpointDetailPage() {
           )}
         </>
       )}
+      <AlertDialog open={confirmResume} onOpenChange={setConfirmResume}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Resume endpoint?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Velox will send matching events to <span className="font-mono break-all">{endpoint?.url}</span>.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => { setConfirmResume(false); void handleResume() }}>Resume</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Layout>
   )
 }

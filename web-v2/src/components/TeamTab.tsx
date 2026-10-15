@@ -3,8 +3,11 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Loader2, Mail, UserPlus, Users } from 'lucide-react'
 import { membersApi, type InvitationView, type MemberView } from '@/lib/members'
-import { ApiError, formatDate } from '@/lib/api'
+import { formatDate } from '@/lib/api'
+import { authApi } from '@/lib/auth'
+import { Callout } from '@/components/Callout'
 import { showApiError } from '@/lib/formErrors'
+import { inviteFormState } from '@/lib/emailOffNotices'
 import { useAuth } from '@/contexts/AuthContext'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -44,6 +47,15 @@ export function TeamTab() {
   const [removeTarget, setRemoveTarget] = useState<MemberView | null>(null)
   const [removing, setRemoving] = useState(false)
 
+  // can_send_invites is the server's own check (dashmembers CanInvite):
+  // false when email or the dashboard address isn't set up, the two cases
+  // where Send invite would be refused. Unknown while loading: form stays on.
+  const { data: whoami } = useQuery({
+    queryKey: ['whoami'],
+    queryFn: () => authApi.whoami(),
+  })
+  const { off: invitesOff, notice: invitesNotice } = inviteFormState(whoami?.can_send_invites)
+
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ['members'],
     queryFn: () => membersApi.list(),
@@ -64,7 +76,12 @@ export function TeamTab() {
     setInviting(true)
     try {
       await membersApi.invite(email)
-      toast.success(`Invitation sent to ${email}`)
+      // Not "sent": the server queues the email (outbox) and refuses
+      // outright when email isn't set up (email_not_configured), so
+      // "on its way" is what a 201 proves. InviteTTL is 7 days.
+      toast.success(`Invitation created for ${email}`, {
+        description: "We're emailing them a link to join. It works for 7 days.",
+      })
       setInviteEmail('')
       invalidate()
     } catch (err) {
@@ -80,7 +97,7 @@ export function TeamTab() {
       toast.success(`Invitation to ${inv.email} revoked`)
       invalidate()
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : 'Failed to revoke invitation')
+      showApiError(err, 'Failed to revoke invitation')
     }
   }
 
@@ -93,7 +110,7 @@ export function TeamTab() {
       setRemoveTarget(null)
       invalidate()
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : 'Failed to remove member')
+      showApiError(err, 'Failed to remove member')
     } finally {
       setRemoving(false)
     }
@@ -109,9 +126,24 @@ export function TeamTab() {
             <h3 className="text-sm font-medium text-foreground">Invite a teammate</h3>
           </div>
           <p className="text-xs text-muted-foreground mb-4">
-            They&apos;ll get an email with a link to join this workspace. Every member has
-            full access — per-role permissions are coming later.
+            They&apos;ll get an email with a link to join this workspace, valid for 7 days. Every
+            member has full access.
           </p>
+          {invitesNotice && (
+            <Callout
+              tone={invitesNotice.tone}
+              title={invitesNotice.title}
+              className="mb-4"
+              details={
+                <p>
+                  For whoever runs Velox: set <code className="font-mono">SMTP_HOST</code> and{' '}
+                  <code className="font-mono">DASHBOARD_BASE_URL</code> (docs/ops/email-setup.md).
+                </p>
+              }
+            >
+              <p>{invitesNotice.body}</p>
+            </Callout>
+          )}
           <form onSubmit={handleInvite} className="flex gap-2 max-w-md">
             <Input
               type="email"
@@ -119,8 +151,9 @@ export function TeamTab() {
               onChange={e => setInviteEmail(e.target.value)}
               placeholder="teammate@company.com"
               aria-label="Email to invite"
+              disabled={invitesOff}
             />
-            <Button type="submit" disabled={inviting || !inviteEmail.trim()}>
+            <Button type="submit" disabled={invitesOff || inviting || !inviteEmail.trim()}>
               {inviting ? <Loader2 size={14} className="animate-spin mr-1.5" /> : <Mail size={14} className="mr-1.5" />}
               {inviting ? 'Sending…' : 'Send invite'}
             </Button>
