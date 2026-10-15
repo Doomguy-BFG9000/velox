@@ -5,7 +5,7 @@ import {
   LayoutDashboard, Users, FileText, CreditCard, Tag, Wallet, LogOut, Settings,
   Receipt, AlertTriangle, ScrollText, Globe, Key, Menu, X, BarChart3,
   Sun, Moon, Search, ChevronsUpDown, MessageSquareWarning, Sparkles, Loader2,
-  Clock as ClockIcon, FlaskConical,
+  Clock as ClockIcon, FlaskConical, ListChecks,
   type LucideIcon,
 } from 'lucide-react'
 import { toast } from 'sonner'
@@ -273,7 +273,7 @@ export function Layout({ children }: { children: ReactNode }) {
   }
   // Drives the live-mode Stripe-missing hard-blocker. The launcher itself
   // calls the same hook — React Query dedupes by key, so no duplicate fetches.
-  const { hasLiveStripe } = useOnboardingSteps()
+  const { hasLiveStripe, offerShowAgain: offerShowChecklist, setDismissed: setChecklistHidden } = useOnboardingSteps()
 
   const handleLogout = async () => {
     await logout()
@@ -465,6 +465,14 @@ export function Layout({ children }: { children: ReactNode }) {
                 <MessageSquareWarning />
                 <span>Report an issue</span>
               </DropdownMenuItem>
+              {/* The only way back once the setup checklist's X was used.
+                  Absent once every step is done: the pill wouldn't return. */}
+              {offerShowChecklist && (
+                <DropdownMenuItem onClick={() => setChecklistHidden(false)}>
+                  <ListChecks />
+                  <span>Show setup checklist</span>
+                </DropdownMenuItem>
+              )}
               <DropdownMenuSeparator />
               <DropdownMenuItem onClick={toggleDark}>
                 {dark ? <Sun /> : <Moon />}

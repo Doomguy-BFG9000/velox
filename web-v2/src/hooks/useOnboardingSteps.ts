@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useSyncExternalStore } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import { useAuth } from '@/contexts/AuthContext'
+import { setupChecklistState } from '@/lib/homeNotices'
 
 export interface OnboardingStep {
   key: 'stripe' | 'plan' | 'customer' | 'subscription' | 'webhook'
@@ -13,7 +14,7 @@ export interface OnboardingStep {
 }
 
 // Per-tenant so a user admin-ing multiple tenants doesn't mute the launcher
-// globally. Clearing localStorage un-dismisses.
+// globally. The account menu's "Show setup checklist" un-dismisses.
 const dismissStorageKey = (tenantID: string) => `velox:getstarted-dismissed:${tenantID}`
 
 function readDismissed(tenantID: string): boolean {
@@ -25,24 +26,37 @@ function readDismissed(tenantID: string): boolean {
   }
 }
 
+// Hiding and showing the checklist happen in different components (the
+// panel's X, the account menu's "Show setup checklist"), each with its own
+// copy of this hook. A change event tells every copy to re-read storage.
+const DISMISS_EVENT = 'velox:getstarted-dismissed'
+
+function subscribeDismissed(onChange: () => void): () => void {
+  window.addEventListener(DISMISS_EVENT, onChange)
+  window.addEventListener('storage', onChange)
+  return () => {
+    window.removeEventListener(DISMISS_EVENT, onChange)
+    window.removeEventListener('storage', onChange)
+  }
+}
+
 export function useOnboardingSteps() {
   const { user } = useAuth()
-  // Bump counter forces a re-read of localStorage after setDismissed. Reading
-  // during render (instead of syncing via useEffect) avoids React's
-  // set-state-in-effect lint warning and keeps the value derived from a
-  // single source of truth.
-  const [bump, setBump] = useState(0)
-  void bump
-  const dismissed = user ? readDismissed(user.tenant_id) : false
+  const dismissed = useSyncExternalStore(
+    subscribeDismissed,
+    () => (user ? readDismissed(user.tenant_id) : false),
+  )
 
-  const setDismissed = () => {
+  // setDismissed(true) hides the checklist; setDismissed(false) shows it again.
+  const setDismissed = (hidden = true) => {
     if (!user) return
     try {
-      localStorage.setItem(dismissStorageKey(user.tenant_id), '1')
+      if (hidden) localStorage.setItem(dismissStorageKey(user.tenant_id), '1')
+      else localStorage.removeItem(dismissStorageKey(user.tenant_id))
     } catch {
       // see above
     }
-    setBump(b => b + 1)
+    window.dispatchEvent(new Event(DISMISS_EVENT))
   }
 
   // Stripe creds are queried even when the launcher is dismissed because the
@@ -53,7 +67,9 @@ export function useOnboardingSteps() {
     enabled: !!user,
   })
 
-  const enabled = !!user && !dismissed
+  // Queried while hidden too: the account menu offers "Show setup checklist"
+  // only when a step is left (setupChecklistState), which needs the steps.
+  const enabled = !!user
   const { data: overview } = useQuery({
     queryKey: ['onboarding-overview'],
     queryFn: () => api.getAnalyticsOverview(),
@@ -85,7 +101,7 @@ export function useOnboardingSteps() {
     {
       key: 'stripe',
       label: 'Connect Stripe',
-      desc: 'Secret + publishable keys so you can charge cards',
+      desc: "Needed to charge your customers' cards",
       to: '/settings?tab=payments',
       cta: 'Connect Stripe',
       done: hasAnyStripe,
@@ -93,7 +109,7 @@ export function useOnboardingSteps() {
     {
       key: 'plan',
       label: 'Create your first plan',
-      desc: 'Meters + rate cards that drive invoicing',
+      desc: 'Set what you charge: a base fee, usage prices, or both',
       to: '/pricing',
       cta: 'Set up pricing',
       done: hasPlans,
@@ -117,7 +133,7 @@ export function useOnboardingSteps() {
     {
       key: 'webhook',
       label: 'Set up a webhook endpoint',
-      desc: 'Receive invoice + subscription events in your app',
+      desc: 'Let your app hear about invoices and subscriptions',
       to: '/webhooks',
       cta: 'Add endpoint',
       done: hasWebhook,
@@ -129,7 +145,7 @@ export function useOnboardingSteps() {
   // Don't flash the launcher before queries settle — avoids "0 of 5" pills
   // flickering for users who've actually completed everything.
   const loaded = !!overview && !!plansList && !!stripeCreds && !!webhookEndpoints
-  const show = enabled && loaded && complete < total
+  const { showPill: show, offerShowAgain } = setupChecklistState(dismissed, loaded, complete, total)
 
   return {
     steps,
@@ -138,6 +154,7 @@ export function useOnboardingSteps() {
     dismissed,
     setDismissed,
     show,
+    offerShowAgain,
     hasLiveStripe,
   }
 }
