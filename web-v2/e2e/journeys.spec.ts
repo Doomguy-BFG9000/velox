@@ -1,5 +1,5 @@
 import fs from 'node:fs'
-import { test, expect } from '@playwright/test'
+import { test, expect, type Locator } from '@playwright/test'
 import { env, seedFile } from './fixtures/env'
 import { api, usd, uniq } from './fixtures/api'
 import {
@@ -29,6 +29,16 @@ test.describe('signed out', () => {
     await page.goto(`/invoice/${invoice.public_token}`)
     await expect(page.getByText(invoice.invoice_number)).toBeVisible()
     await expect(page.getByText('Total', { exact: true }).locator('..')).toContainText(usd(invoice.total_amount_cents))
+  })
+
+  test('sign-in follows dark mode; the hosted invoice stays light', async ({ page }) => {
+    const { invoice } = JSON.parse(fs.readFileSync(seedFile, 'utf8')) as Seed
+    await page.addInitScript(() => localStorage.setItem('velox-theme', 'dark'))
+    await page.goto('/login')
+    await expect(page.locator('html')).toHaveClass(/\bdark\b/)
+    await page.goto(`/invoice/${invoice.public_token}`)
+    await expect(page.getByText(invoice.invoice_number)).toBeVisible()
+    await expect(page.locator('html')).not.toHaveClass(/\bdark\b/)
   })
 })
 
@@ -85,10 +95,87 @@ test('advance a test clock to the renewal and see the invoice', async ({ page })
 
   await page.goto('/invoices')
   await page.getByPlaceholder('Search by invoice number...').fill(invoice.invoice_number)
+  // The list names the state as the invoice page does: "Open", not the raw
+  // "finalized".
+  expect(invoice.status).toBe('finalized')
+  const row = page.getByRole('row').filter({ hasText: invoice.invoice_number })
+  await expect(row.getByText('Open', { exact: true })).toBeVisible()
+  await expect(row).not.toContainText('finalized')
   await page.getByRole('link', { name: invoice.invoice_number, exact: true }).click()
   await expect(page.getByRole('heading', { level: 1, name: invoice.invoice_number, exact: true })).toBeVisible()
   await expect(page.getByText('Subtotal', { exact: true }).locator('..')).toContainText(usd(invoice.subtotal_cents))
   await expect(page.getByText('Amount Due', { exact: true }).locator('..')).toContainText(usd(invoice.amount_due_cents))
+})
+
+test('a dialog taller than the window keeps its actions in view', async ({ page }) => {
+  const customer = await createCustomer()
+  await page.setViewportSize({ width: 1440, height: 520 })
+  await page.goto(`/customers/${customer.id}`)
+  await page.getByRole('button', { name: 'New invoice' }).click()
+  const dialog = page.getByRole('dialog', { name: 'New invoice' })
+  await expect(dialog).toBeVisible()
+  // The dialog is capped at the window and scrolls inside itself...
+  expect(await dialog.evaluate(el => el.scrollHeight > el.clientHeight)).toBe(true)
+  // ...while Cancel and Save & send stay on screen.
+  await expect(dialog.getByRole('button', { name: 'Save & send' })).toBeInViewport()
+  await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeInViewport()
+})
+
+// True when the element's box lies inside the box of `outer` (by default the
+// window). A dialog whose content is wider than the dialog pushes its buttons
+// past the right edge, where no one can reach them.
+async function boxInside(el: Locator, outer?: Locator) {
+  const b = await el.boundingBox()
+  const o = outer ? await outer.boundingBox() : { x: 0, y: 0, ...el.page().viewportSize()! }
+  if (!b || !o) return false
+  return b.x >= o.x - 0.5 && b.y >= o.y - 0.5 && b.x + b.width <= o.x + o.width + 0.5 && b.y + b.height <= o.y + o.height + 0.5
+}
+
+for (const width of [1440, 390]) {
+  test(`change plan at ${width}px: a long plan name keeps the button in the dialog`, async ({ page }) => {
+    const { subscription } = await subscribedCustomer()
+    const other = await createPlan()
+    await page.setViewportSize({ width, height: 844 })
+    await page.goto(`/subscriptions/${subscription.id}`)
+    await page.getByRole('button', { name: 'Change Plan', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'Change Plan' })
+    await dialog.getByRole('button', { name: 'Select a plan...' }).click()
+    await page.getByRole('option', { name: new RegExp(other.code) }).click()
+    await expect(dialog.getByRole('button', { name: new RegExp(other.code) })).toBeVisible()
+    // Nothing in the dialog is wider than the dialog, and both actions are
+    // fully inside it and on screen.
+    expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
+    for (const name of ['Change Plan', 'Cancel']) {
+      const button = dialog.getByRole('button', { name, exact: true })
+      expect(await boxInside(button, dialog)).toBe(true)
+      expect(await boxInside(button)).toBe(true)
+    }
+  })
+}
+
+test('new invoice at phone width fits the dialog', async ({ page }) => {
+  const customer = await createCustomer()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.goto(`/customers/${customer.id}`)
+  await page.getByRole('button', { name: 'New invoice' }).click()
+  const dialog = page.getByRole('dialog', { name: 'New invoice' })
+  await expect(dialog).toBeVisible()
+  expect(await boxInside(dialog)).toBe(true)
+  // No content wider than the dialog: no sideways scroll inside it, and every
+  // field and button sits within its left and right edges (a clipped field
+  // would not show up as scroll).
+  expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
+  const outside = await dialog.evaluate(el => {
+    const d = el.getBoundingClientRect()
+    return [...el.querySelectorAll('input:not([aria-hidden="true"]), button, textarea, [role="combobox"]')]
+      .filter(c => { const r = c.getBoundingClientRect(); return r.width > 0 && (r.left < d.left - 0.5 || r.right > d.right + 0.5) })
+      .map(c => c.getAttribute('aria-label') || c.getAttribute('placeholder') || c.textContent)
+  })
+  expect(outside).toEqual([])
+  // ...and the actions are inside it and on screen.
+  const send = dialog.getByRole('button', { name: 'Save & send' })
+  await expect(send).toBeInViewport({ ratio: 1 })
+  expect(await boxInside(send, dialog)).toBe(true)
 })
 
 test('grant credits and see the balance', async ({ page }) => {
