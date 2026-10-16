@@ -252,7 +252,7 @@ the validation checks above. Schedule quarterly restore drills:
 2. Restore to a non-production database.
 3. Run the validation queries.
 4. Boot Velox against the restored DB; hit `/health/ready`.
-5. Run the smoke tests in `MANUAL_TEST.md` (FLOW S1).
+5. Run `go run ./cmd/velox-doctor` against the restored DB and check it reports no problems.
 
 A backup you've never restored is hope, not a backup.
 
