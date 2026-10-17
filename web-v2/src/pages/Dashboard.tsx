@@ -10,6 +10,7 @@ import { timeAgo, wallClockNow } from '@/lib/effectiveNow'
 import { useEffectiveNowResolver, useTestClocks } from '@/hooks/useClockFrozenMap'
 import { useAuth } from '@/contexts/AuthContext'
 import { NoticeRow } from '@/components/NoticeRow'
+import { CUSTOMERS_DEFINITION, FAILED_PAYMENTS_DEFINITION, customersTrend, failedPaymentsTrend, subscriptionsHint } from '@/lib/homeKpis'
 import { SIMULATED_TOTALS_SENTENCE, SIMULATED_TOTALS_TITLE, showSimulatedTotalsNote } from '@/lib/homeNotices'
 import { Layout } from '@/components/Layout'
 import { LoadError } from '@/components/LoadError'
@@ -87,16 +88,10 @@ export default function DashboardPage() {
   // The server returns only buckets with revenue; the chart plots every bucket
   // in the window, zero where nothing was paid, so a gap reads as a gap. The
   // window is anchored on the fetch time, the closest client-side match to the
-  // server's time.Now(). The MRR card's sparkline below still reads the raw
-  // points; it is out of scope here.
+  // server's time.Now().
   const chartSeries = useMemo(
     () => fillRevenueBuckets(chartData, chartRes?.period ?? period, chartFetchedAt),
     [chartData, chartRes?.period, period, chartFetchedAt],
-  )
-
-  const sparklineRevenue = useMemo(
-    () => chartData.map(d => d.revenue_cents).slice(-12),
-    [chartData],
   )
 
   // Attention items surface things the operator should act on. Empty list = quiet state.
@@ -205,7 +200,6 @@ export default function DashboardPage() {
               value={formatCents(overview.mrr, overview.currency)}
               current={overview.mrr}
               previous={overview.mrr_prev}
-              sparkline={sparklineRevenue}
               hint={`ARR ${formatCents(overview.arr, overview.currency)}`}
             />
             <TrendCard
@@ -216,26 +210,20 @@ export default function DashboardPage() {
               hint={`${overview.paid_invoices} ${overview.paid_invoices === 1 ? 'invoice' : 'invoices'} paid`}
             />
             <TrendCard
-              label="Active Customers"
-              value={overview.active_customers}
-              current={overview.active_customers}
-              previous={overview.active_customers - overview.new_customers}
-              hint={
-                <>
-                  +{overview.new_customers} new · {overview.active_subscriptions} subs
-                  {overview.trialing_subscriptions > 0 && ` · ${overview.trialing_subscriptions} trialing`}
-                </>
-              }
+              label="Customers"
+              definition={CUSTOMERS_DEFINITION}
+              value={overview.live_customers}
+              {...customersTrend(overview)}
+              hint={subscriptionsHint(overview)}
             />
             <TrendCard
-              label="Failed Payments"
+              label="Failed payments"
+              definition={FAILED_PAYMENTS_DEFINITION}
               value={overview.failed_payments}
-              current={overview.failed_payments}
-              previous={0}
+              {...failedPaymentsTrend(overview)}
               inverseDelta
               valueTone={overview.failed_payments > 0 ? 'danger' : 'default'}
-              hint={`${PERIOD_LABELS[period]}`}
-              sparklineTone="danger"
+              hint={`${overview.failed_payments_prev} in the previous ${PERIOD_LABELS[period].toLowerCase()}`}
             />
           </div>
 
