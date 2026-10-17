@@ -109,14 +109,19 @@ export default function DunningPage() {
   usePageTitle('Dunning')
   return (
     <Layout>
-      <div className="flex items-center justify-between">
-        <div>
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div className="max-w-3xl">
           <h1 className="text-2xl font-semibold text-foreground">Dunning</h1>
+          {/* Final actions: domain.DunningSubscriptionAction (none, pause,
+              cancel) and DunningInvoiceAction (none, mark_uncollectible).
+              No enabled policy = StartDunning skips the invoice. */}
           <p className="text-sm text-muted-foreground mt-1">
-            Recover failed payments automatically
+            When a payment fails, Velox retries it on the schedule in your dunning policy and, if email is set up,
+            emails the customer. If every retry fails, it does what the policy says: pause or cancel the subscription,
+            write off the invoice, or leave them for you to handle. With no policy, nothing is retried.
           </p>
         </div>
-        <Link to="/dunning-policies">
+        <Link to="/dunning-policies" className="shrink-0 self-start">
           <Button variant="outline" size="sm">Manage policies</Button>
         </Link>
       </div>
@@ -246,7 +251,7 @@ function RunsTab() {
       {/* Filter — keep visible whenever a filter is active, even if the
           filtered total is zero, so the user can always click back to All. */}
       {(total > 0 || filterStatus) && (
-        <div className="flex items-center gap-2 mt-4">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 mt-4">
           <div className="flex gap-1 bg-muted rounded-lg p-1">
             {[
               { value: '', label: 'All' },
@@ -265,6 +270,9 @@ function RunsTab() {
               </button>
             ))}
           </div>
+          <p className="text-xs text-muted-foreground">
+            Escalated: every retry failed and your policy&rsquo;s final step was taken.
+          </p>
         </div>
       )}
 
@@ -288,12 +296,12 @@ function RunsTab() {
                 </>
               ) : (
                 <>
-                  <p className="text-sm font-medium text-foreground">No dunning runs</p>
+                  <p className="text-sm font-medium text-foreground">No failed payments to retry</p>
                   <p className="text-sm text-muted-foreground mt-1">
-                    Dunning runs will appear here when Velox detects a failed payment and begins the recovery process.
+                    An invoice shows up here when its payment fails and Velox starts retrying it.
                   </p>
                   <Link to="/dunning-policies" className="inline-block mt-4">
-                    <Button variant="outline" size="sm">Configure a dunning policy</Button>
+                    <Button variant="outline" size="sm">Set up a retry policy</Button>
                   </Link>
                 </>
               )}

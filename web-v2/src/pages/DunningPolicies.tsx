@@ -131,14 +131,14 @@ export default function DunningPoliciesPage() {
   return (
     <Layout>
       <div className="space-y-6">
-        <div className="flex items-center justify-between">
-          <div>
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div className="max-w-3xl">
             <h1 className="text-2xl font-semibold text-foreground">Dunning policies</h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Named retry policies (campaigns). One is the tenant default; customers can be assigned to other policies on the customer detail page.
+              A policy sets how many times to retry a failed payment, how long to wait between tries, and what happens if every retry fails. Your default policy applies to every customer unless you pick another on their page.
             </p>
           </div>
-          <Button onClick={() => setShowCreate(true)}>
+          <Button className="shrink-0 self-start" onClick={() => setShowCreate(true)}>
             <Plus size={16} className="mr-2" /> New policy
           </Button>
         </div>
@@ -224,7 +224,7 @@ export default function DunningPoliciesPage() {
           <AlertDialogHeader>
             <AlertDialogTitle>Delete policy &ldquo;{deleteTarget?.name}&rdquo;?</AlertDialogTitle>
             <AlertDialogDescription>
-              The policy is removed permanently. Customers fall back to the tenant default policy for future failed payments.
+              The policy is removed permanently. Customers fall back to your default policy for future failed payments.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
