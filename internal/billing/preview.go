@@ -100,17 +100,47 @@ func (e *Engine) Preview(ctx context.Context, sub domain.Subscription) (PreviewR
 	if len(sub.Items) == 0 {
 		return PreviewResult{}, fmt.Errorf("subscription has no items")
 	}
+	return e.previewCycle(ctx, sub)
+}
+
+// previewCycle estimates the invoice the cycle close will issue for the
+// subscription's CURRENT period. It is what the operator surfaces show (the
+// subscription page and create_preview's default window), so it mirrors the
+// close rather than the threshold scan: base fees come from the close's own
+// closeBaseFeeLines (a calendar stub, a mid-period add, a quantity change or
+// a plan swap prorates exactly as the invoice will), and usage is rated over
+// the same per-meter windows the close bills (meterUsageIntervals). Before
+// 2026-10-16 the preview showed the full base fee for a 19-day calendar stub
+// the close billed at 19/31 (M-SUB-1).
+//
+// A trialing subscription's current period is its first paid period (it
+// starts at the trial end, firstPeriodAfterTrial), so its preview is the
+// first invoice after the trial — see previewTrialEnd. The exception is a
+// trial that outlasts the current period: the close at its end only advances
+// it, so that keeps the flat window estimate.
+func (e *Engine) previewCycle(ctx context.Context, sub domain.Subscription) (PreviewResult, error) {
 	periodStart := *sub.CurrentBillingPeriodStart
 	periodEnd := *sub.CurrentBillingPeriodEnd
-	return e.previewWithWindow(ctx, sub, periodStart, periodEnd)
+	if sub.Status == domain.SubscriptionTrialing && sub.TrialEndAt != nil && sub.TrialEndAt.After(periodEnd) {
+		return e.previewWithWindow(ctx, sub, periodStart, periodEnd)
+	}
+	return e.previewWindow(ctx, sub, periodStart, periodEnd, true)
 }
 
 // previewWithWindow is the explicit-period variant. Used by the
-// create_preview service when the caller passes a custom window; the
-// wall-clock Preview entry above defers to the subscription's current
-// cycle. Both paths converge here so the per-line composition stays in
-// one place.
+// create_preview service when the caller passes a custom window, and by the
+// threshold scan, which persists these lines as a fire invoice and depends
+// on the FULL (unprorated) in_arrears base line (it prorates reset-mode
+// bases itself). Both paths converge in previewWindow so the per-line
+// composition stays in one place.
 func (e *Engine) previewWithWindow(ctx context.Context, sub domain.Subscription, periodStart, periodEnd time.Time) (PreviewResult, error) {
+	return e.previewWindow(ctx, sub, periodStart, periodEnd, false)
+}
+
+// previewWindow composes the preview. asClose=true mirrors the cycle close
+// for [periodStart, periodEnd] (previewCycle); asClose=false is the flat
+// window estimate (previewWithWindow).
+func (e *Engine) previewWindow(ctx context.Context, sub domain.Subscription, periodStart, periodEnd time.Time, asClose bool) (PreviewResult, error) {
 	plans := make(map[string]domain.Plan, len(sub.Items))
 	planNames := make([]string, 0, len(sub.Items))
 	var allMeterIDs []string
@@ -162,6 +192,10 @@ func (e *Engine) previewWithWindow(ctx context.Context, sub domain.Subscription,
 		Lines:              []PreviewLine{},
 		Warnings:           []string{},
 		GeneratedAt:        e.clock.Now(ctx),
+	}
+
+	if asClose {
+		return e.previewAsClose(ctx, sub, plans, allMeterIDs, periodStart, periodEnd, result)
 	}
 
 	// Base-fee lines from each subscription item's plan. Quantity here is
@@ -233,10 +267,8 @@ func (e *Engine) previewWithWindow(ctx context.Context, sub domain.Subscription,
 	//
 	// Cap: only when there's billable usage the cap could scale — a
 	// configured cap on a zero-usage period can't bind, so no warning.
-	if usageLineCount > 0 && sub.UsageCapUnits != nil && *sub.UsageCapUnits > 0 && sub.OverageAction == "block" {
-		result.Warnings = append(result.Warnings, fmt.Sprintf(
-			"Estimate excludes the subscription's usage cap (%d units per period); if billable usage exceeds the cap, the actual invoice will be lower.",
-			*sub.UsageCapUnits))
+	if msg, ok := capWarning(sub, usageLineCount); ok {
+		result.Warnings = append(result.Warnings, msg)
 	}
 
 	// Segment proration: a mid-LIFE change within [periodStart, periodEnd]
@@ -273,6 +305,209 @@ func (e *Engine) previewWithWindow(ctx context.Context, sub domain.Subscription,
 
 	result.Totals = computePreviewTotals(result.Lines)
 	return result, nil
+}
+
+// capWarning is the estimate-scope note for a block-mode usage cap, which
+// neither preview replicates (ADR-045). Only when there is billable usage
+// the cap could scale — a cap on a zero-usage period can't bind.
+func capWarning(sub domain.Subscription, usageLineCount int) (string, bool) {
+	if usageLineCount > 0 && sub.UsageCapUnits != nil && *sub.UsageCapUnits > 0 && sub.OverageAction == "block" {
+		return fmt.Sprintf(
+			"Estimate excludes the subscription's usage cap (%d units per period); if billable usage exceeds the cap, the actual invoice will be lower.",
+			*sub.UsageCapUnits), true
+	}
+	return "", false
+}
+
+// previewAsClose is previewCycle's composition: the lines the cycle close
+// would build for [periodStart, periodEnd] from the usage recorded so far.
+// It reads the same inputs the close reads — billing_intervals segments,
+// the threshold watermark, the invoice currency, the tenant zone — and
+// shares the base-fee math (closeBaseFeeLines) and the usage windows
+// (meterUsageIntervals) with buildLineItems. What it does not replicate is
+// named in a warning: the usage cap (capWarning), and the tier ladder and
+// deferred max/last buckets after a threshold fire (watermark warning).
+func (e *Engine) previewAsClose(ctx context.Context, sub domain.Subscription, plans map[string]domain.Plan, meterOrder []string, periodStart, periodEnd time.Time, result PreviewResult) (PreviewResult, error) {
+	loc, err := e.tenantLocation(ctx, sub.TenantID)
+	if err != nil {
+		return PreviewResult{}, err
+	}
+	currency, err := e.invoiceCurrency(ctx, sub, plans[sub.Items[0].PlanID].Currency)
+	if err != nil {
+		return PreviewResult{}, err
+	}
+	if sub.Status == domain.SubscriptionTrialing && trialCancelsFree(sub) {
+		// handleTrialState cancels free at trial end: no invoice.
+		result.Warnings = append(result.Warnings, "A cancel is scheduled for the end of the trial, so no invoice will be issued.")
+		result.Totals = computePreviewTotals(result.Lines)
+		return result, nil
+	}
+	if sub.Status == domain.SubscriptionTrialing {
+		if res, ok, err := e.previewTrialEnd(ctx, sub, plans, meterOrder, periodStart, periodEnd, loc, result); ok || err != nil {
+			return res, err
+		}
+	}
+	wm, err := e.loadThresholdWatermark(ctx, sub.TenantID, sub.ID, periodStart, periodEnd)
+	if err != nil {
+		return PreviewResult{}, err
+	}
+	var segsByItem map[string][]baseSegment
+	if sub.Status == domain.SubscriptionTrialing {
+		segsByItem = trialConversionSegments(sub, periodStart, periodEnd)
+	} else {
+		segsByItem, err = e.windowSegments(ctx, sub, periodStart, periodEnd)
+		if err != nil {
+			return PreviewResult{}, fmt.Errorf("preview: resolve segments: %w", err)
+		}
+	}
+	// Plans referenced only by a segment (a removed item, a pre-swap plan)
+	// bill their segment too — same hydration as buildLineItems.
+	for _, segs := range segsByItem {
+		for _, seg := range segs {
+			if seg.planID == "" {
+				continue
+			}
+			if _, ok := plans[seg.planID]; ok {
+				continue
+			}
+			pl, err := e.pricing.GetPlan(ctx, sub.TenantID, seg.planID)
+			if err != nil {
+				return PreviewResult{}, fmt.Errorf("get segment plan %s: %w", seg.planID, err)
+			}
+			plans[seg.planID] = pl
+		}
+	}
+
+	// The close runs at periodEnd; a scheduled cancel firing there skips
+	// the upcoming in_advance base.
+	terminal := shouldFireScheduledCancel(sub, periodEnd, periodEnd)
+	for _, bl := range closeBaseFeeLines(sub, segsByItem, plans, periodStart, periodEnd, currency, loc, terminal, wm.billedThrough != nil) {
+		result.Lines = append(result.Lines, PreviewLine{
+			LineType:        "base_fee",
+			Description:     bl.line.Description,
+			Currency:        bl.line.Currency,
+			Quantity:        decimal.NewFromInt(bl.line.Quantity),
+			UnitAmountCents: bl.line.UnitAmountCents,
+			AmountCents:     bl.line.AmountCents,
+			PlanID:          bl.plan.ID,
+			BaseBillTiming:  bl.plan.BaseBillTiming,
+		})
+	}
+
+	// Usage: each meter over the windows a plan carrying it was on the
+	// subscription, clamped to the threshold watermark — the close's
+	// meterUsageIntervals. Meters only a segment plan carries come after the
+	// current plans' meters.
+	order := append([]string(nil), meterOrder...)
+	seen := make(map[string]struct{}, len(order))
+	for _, mid := range order {
+		seen[mid] = struct{}{}
+	}
+	for _, pl := range plans {
+		for _, mid := range pl.MeterIDs {
+			if _, ok := seen[mid]; !ok {
+				seen[mid] = struct{}{}
+				order = append(order, mid)
+			}
+		}
+	}
+	meterIntervals, _ := meterUsageIntervals(sub, segsByItem, plans, periodStart, periodEnd, wm.billedThrough)
+	capped := sub.UsageCapUnits != nil && *sub.UsageCapUnits > 0 && sub.OverageAction == "block"
+	ladder := newUsageLadder(wm, capped)
+	usageLineCount := 0
+	for _, meterID := range order {
+		price := func(rule domain.RatingRuleVersion, bucketKey string, mode domain.AggregationMode, qty decimal.Decimal) (int64, error) {
+			return ladder.price(rule, meterID, bucketKey, mode, qty)
+		}
+		for _, iv := range mergeUsageIntervals(meterIntervals[meterID]) {
+			lines, warnings, unpriced, err := e.rateMeterWindow(ctx, sub.TenantID, sub.CustomerID, meterID, iv.start, iv.end, periodStart, price)
+			if err != nil {
+				return PreviewResult{}, fmt.Errorf("preview meter %q: %w", meterID, err)
+			}
+			for i := range lines {
+				lines[i].Currency = currency
+			}
+			result.Lines = append(result.Lines, lines...)
+			result.Warnings = append(result.Warnings, warnings...)
+			result.unpriced = append(result.unpriced, unpriced...)
+			usageLineCount += len(lines)
+		}
+	}
+
+	if msg, ok := capWarning(sub, usageLineCount); ok {
+		result.Warnings = append(result.Warnings, msg)
+	}
+	if wm.billedThrough != nil {
+		result.Warnings = append(result.Warnings, fmt.Sprintf(
+			"A spend-threshold invoice already billed this period through %s; this estimate shows only what is left. Tiered prices and max or last-value meters may differ on the actual invoice.",
+			wm.billedThrough.In(loc).Format("Jan 2, 2006 15:04 MST")))
+	}
+
+	result.Totals = computePreviewTotals(result.Lines)
+	return result, nil
+}
+
+// trialConversionSegments are the segments a trialing subscription's items
+// will have once the trial converts. A trialing sub has no billing_intervals
+// rows yet: the conversion opens every item at the post-trial period start
+// (intervalOpenForItems, source "trial_convert"), which is the current
+// period's start. Derived through intervalSegmentsByItem, the reader the
+// close uses, so the preview clips them exactly as the close will.
+func trialConversionSegments(sub domain.Subscription, periodStart, periodEnd time.Time) map[string][]baseSegment {
+	rows := make(map[string][]domain.ItemInterval, len(sub.Items))
+	for _, it := range sub.Items {
+		rows[it.ID] = []domain.ItemInterval{{
+			SubscriptionItemID: it.ID, PlanID: it.PlanID, Quantity: it.Quantity, StartsAt: periodStart,
+		}}
+	}
+	return intervalSegmentsByItem(rows, periodStart, periodEnd)
+}
+
+// previewTrialEnd is the preview of a trialing subscription with an
+// in_advance item: the first invoice after the trial is the one the trial
+// end issues (ActivateAfterTrialWithBill → BillOnCreateTx), the in_advance
+// base fees for the first paid period, prorated on a calendar stub. Its
+// lines come from onCreateBaseLines, the math that invoice uses. ok=false
+// when no item is in_advance: the first invoice is then the first period's
+// close, which previewAsClose composes from trialConversionSegments.
+func (e *Engine) previewTrialEnd(ctx context.Context, sub domain.Subscription, plans map[string]domain.Plan, meterIDs []string, periodStart, periodEnd time.Time, loc *time.Location, result PreviewResult) (PreviewResult, bool, error) {
+	// Every item shares one bill timing (rejectMixedItemIntervals on every
+	// item write; a live plan's timing is immutable), so either all items
+	// are in_advance or none is.
+	var advanceItems []domain.SubscriptionItem
+	for _, it := range sub.Items {
+		if plans[it.PlanID].BaseBillTiming == domain.BillInAdvance {
+			advanceItems = append(advanceItems, it)
+		}
+	}
+	if len(advanceItems) == 0 {
+		return PreviewResult{}, false, nil
+	}
+	currency, err := e.invoiceCurrency(ctx, sub, plans[advanceItems[0].PlanID].Currency)
+	if err != nil {
+		return PreviewResult{}, true, err
+	}
+	for _, bl := range onCreateBaseLines(sub, plans, advanceItems, periodStart, periodEnd, currency, loc) {
+		result.Lines = append(result.Lines, PreviewLine{
+			LineType:        "base_fee",
+			Description:     bl.line.Description,
+			Currency:        bl.line.Currency,
+			Quantity:        decimal.NewFromInt(bl.line.Quantity),
+			UnitAmountCents: bl.line.UnitAmountCents,
+			AmountCents:     bl.line.AmountCents,
+			PlanID:          bl.plan.ID,
+			BaseBillTiming:  bl.plan.BaseBillTiming,
+		})
+	}
+	// The trial-end invoice covers the first paid period itself, not the
+	// one after it (the in_advance header shift does not apply).
+	result.BillingPeriodStart, result.BillingPeriodEnd = periodStart, periodEnd
+	if len(meterIDs) > 0 {
+		result.Warnings = append(result.Warnings,
+			"This is the invoice issued when the trial ends. Usage for this period is on the invoice at the end of the period.")
+	}
+	result.Totals = computePreviewTotals(result.Lines)
+	return result, true, nil
 }
 
 // previewMeter rates one meter's events for the customer over [from, to)
