@@ -14393,12 +14393,16 @@ export const getCreateDunningPolicyUrl = () => {
 
 /**
  * A dunning policy decides how failed payments are retried and what
- * happens when the retries run out. The first policy created in a
- * tenant and mode becomes the default; later ones do not (use
- * set-default). Customers without an assigned policy use the default.
+ * happens when the retries run out. Every account starts with one
+ * policy per mode, "Default retries", as the default. The first
+ * enabled policy you create in a mode takes the default from it,
+ * unless you have edited it or made it the default yourself; later
+ * ones do not (use set-default). Customers without an assigned policy
+ * use the default, so check `is_default` in the response.
  *
  * `enabled` defaults to false. A disabled policy starts no dunning, so
- * send `enabled: true` for the policy to take effect.
+ * send `enabled: true` for the policy to take effect. A policy created
+ * disabled never takes the default from "Default retries".
  * @summary Create dunning policy
  */
 export const createDunningPolicy = async (dunningPolicyInput: DunningPolicyInput, options?: RequestInit): Promise<DunningPolicy> => {
