@@ -3121,7 +3121,13 @@ export const getGetV1CreditsGrantsCustomerIdUrl = (customerId: string,
  * drawn / remaining per grant, expiry, and remaining split by
  * cost-basis class (commit = money-backed, promotional = free,
  * other = legacy/adjustments). include_exhausted=true adds
- * fully-drawn blocks for history.
+ * fully-drawn blocks for history. Each grant's `consumed_cents`
+ * also counts credit no invoice used: `expired_cents`, the part that
+ * expired unused; `retired_cents`, commit credit taken back when the
+ * invoice that funded it was voided or refunded by a credit note; and
+ * `deducted_cents`, the part an operator deduction (a negative
+ * adjustment) drew from this grant. The credit invoices actually used
+ * is `consumed_cents - expired_cents - retired_cents - deducted_cents`.
  * @summary Per-grant burndown + kind subtotals
  */
 export const getV1CreditsGrantsCustomerId = async (customerId: string,
