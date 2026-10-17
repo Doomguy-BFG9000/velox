@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback, useEffect } from 'react'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, formatDateTime } from '@/lib/api'
 import { CustomerCombobox } from '@/components/CustomerCombobox'
 import { useTenantTimezone } from '@/hooks/useTenantTimezone'
@@ -16,6 +16,7 @@ import { Layout } from '@/components/Layout'
 import { LoadError } from '@/components/LoadError'
 import { toast } from 'sonner'
 import { TestClockBadge } from '@/components/TestClockBadge'
+import { HeldUsageNotice } from '@/components/HeldUsageNotice'
 import { cn } from '@/lib/utils'
 import { fillDays, meterModeBadge, meterValueCaption, sparklinePoints } from '@/lib/usageSummary'
 import { KpiStrip } from '@/components/page/KpiStrip'
@@ -50,6 +51,7 @@ const PAGE_SIZE = 25
 
 export default function UsageEventsPage() {
   usePageTitle('Usage events')
+  const queryClient = useQueryClient()
   const [urlState, setUrlState] = useUrlState({
     customer: '',
     meter: '',
@@ -268,6 +270,17 @@ export default function UsageEventsPage() {
           </Button>
         )}
       </div>
+
+      {/* Usage LiteLLM sent for a customer or meter that does not exist yet:
+          kept, not billed, until released (#1044). */}
+      <HeldUsageNotice
+        className="mt-6"
+        onReleased={() => {
+          // Released rows are usage events now: refresh the list and the totals.
+          loadEvents()
+          queryClient.invalidateQueries({ queryKey: ['usage-events-aggregate'] })
+        }}
+      />
 
       {/* Filter bar */}
       {/* Wraps: 'custom' adds two date pickers, and six controls overflow a
