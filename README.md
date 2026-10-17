@@ -8,11 +8,17 @@
 
 **Who it is for:** teams that charge their customers by usage, most of all AI products that charge per token, and that want to keep their billing data on their own servers.
 
-**Why it exists:**
+**Why it exists: small AI teams kept falling into the same gaps.**
 
-- **AI prices are hard to bill.** Each model, and each kind of token (input, output, cached), has its own price. Velox prices them all with one meter (a counter for one kind of usage).
-- **Customers can pay up front.** You can sell prepaid credit (a prepaid commit), and later usage draws it down.
-- **You see your margin.** Velox shows what you billed each customer next to what your AI provider charged you for their usage.
+| What small AI teams run into | What Velox does instead |
+|---|---|
+| **Stripe Billing takes a cut.** Its pay-as-you-go plan charges 0.7% of billing volume ([Stripe pricing](https://stripe.com/billing/pricing)). Its basic usage billing can't charge a different rate per model and token type on one meter. For that, Stripe points you to Metronome, its main usage-billing product ([Stripe docs](https://docs.stripe.com/billing/subscriptions/usage-based/compare-metronome)). | **No Stripe Billing fee.** Velox does the billing and asks Stripe only to charge the card. Stripe still charges its normal card fee, and Stripe Tax's fee if you use Stripe Tax. One meter carries model and token type. |
+| **Open-source billing engines hold back key parts behind a paid licence.** In Lago, automatic failed-payment retries and invoice previews need a premium licence. In Flexprice, the billing, invoice and subscription services sit under an enterprise licence. Kill Bill's usage aggregation and wallets are in its paid add-on, Aviate. ([Sources](docs/comparison.md)) | **One MIT licence, nothing held back.** Failed-payment retries, credit notes, refunds, invoice previews and the audit log are all in it. |
+| **They are heavy to run yourself.** Flexprice's default setup runs nine services, including Kafka, ClickHouse and Temporal. OpenMeter's runs eleven and calls itself "not a production topology". Across these projects, more than 30 people have reported a fresh install failing before the first invoice, often at sign-up (for example [lago#514](https://github.com/getlago/lago/issues/514) and [flexprice#819](https://github.com/flexprice/flexprice/issues/819)). | **Small enough to run yourself.** One server program plus Postgres and Redis, with a web dashboard. Try it on your laptop in about five minutes. |
+| **No way to fast-forward time to test a billing change.** We found no test clock in Lago or Flexprice. Kill Bill has one clock for the whole server. | **Test clocks for test customers.** Pin a test customer to a clock and move it forward up to a year at a time, so months of billing run in minutes. It works in test mode, on your normal install. |
+| **No idea which customers lose you money.** AI costs move with usage, so a customer can cost you more than they pay. | **Margin per customer.** Velox records what each request cost you, from your provider price table or LiteLLM's reported cost, next to what you billed. |
+
+Velox is young: pre-1.0, one maintainer, Stripe and cards only, no SDKs yet. [How it compares](docs/comparison.md) lists where the others are ahead.
 
 Velox owns the billing layer above the card charge: pricing, subscriptions, usage metering, invoicing, credits, and dunning (the automatic retry-and-escalate process that runs when a payment fails). Stripe still executes the card charge underneath, as a plain PaymentIntent. So Stripe Billing's percentage fee does not apply. Your usage and invoice records live in your own Postgres. Stripe sees each charge, and also the invoice lines if you use Stripe Tax. Customers can also pay another way, such as a bank transfer, and you mark the invoice paid.
 
@@ -122,6 +128,17 @@ To run it for real, on one VM with Docker Compose: [`docs/self-host.md`](docs/se
 - **MIT, and nothing is gated.** No licence key, no paid tier, no telemetry. Dunning, credit notes, refunds and the audit log are all in the one edition. [What's in the box](docs/features.md#runs-on-your-own-servers)
 - **Test a billing change before it bills anyone.** In test mode, a test clock moves a test customer through months of billing without waiting for real time, up to a year per call. [What's in the box](docs/features.md#reliability)
 - **Built so the invoice is right.** Every period close locks the subscription and checks its period, and Postgres refuses a second period-end invoice for the same subscription and period. A voided invoice does not count. [How Velox is engineered](docs/ENGINEERING.md)
+
+---
+
+## Who it fits
+
+Velox fits a small or mid-size team that bills its customers by usage:
+
+- **You charge by usage**, most of all an AI product that prices per token, by model and token type.
+- **You want billing on your own servers.** Your usage and invoice data stay in your own Postgres. Stripe only charges the card.
+- **One engineer can run it.** There are three parts: the Velox server, Postgres, and Redis for rate limiting. There is no Kafka, no analytics database, and no queue or workflow service to run and upgrade.
+- **Your volume is up to about a million usage events a day.** That is roughly 400,000 AI requests, because each request sends two or three events (input, output, cache). In load tests, a mid-size Postgres (32 GB of memory) took a steady 1,000 events a second. Velox keeps every raw event, so plan about 15 to 20 GB of database disk per month at that volume. [How we measured](docs/scale.md)
 
 ---
 
