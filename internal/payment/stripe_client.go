@@ -10,6 +10,7 @@ import (
 
 	"github.com/stripe/stripe-go/v82"
 
+	"github.com/sagarsuperuser/velox/internal/domain"
 	"github.com/sagarsuperuser/velox/internal/errs"
 )
 
@@ -36,7 +37,7 @@ func stripeErrorMessage(err error) string {
 // querying Stripe after a cool-off window.
 type PaymentError struct {
 	Message         string
-	DeclineCode     string // non-empty for card declines (card_declined, insufficient_funds, etc.)
+	DeclineCode     string // why the card was refused (insufficient_funds, lost_card, …): see declineCodeOf
 	PaymentIntentID string // set when Stripe returned a PI object alongside the error
 	Unknown         bool
 }
@@ -118,6 +119,24 @@ func isIdempotencyConflict(err error) bool {
 	return errors.As(err, &stripeErr) && stripeErr.Type == stripe.ErrorTypeIdempotency
 }
 
+// declineCodeOf is the code that says why Stripe refused a card: the error's
+// decline_code, or, on a card_error that has none, the error's code when that
+// code is a hard decline (domain.IsHardDecline, #966). Stripe sends
+// incorrect_number either way: as the bank's decline code under
+// card_declined, or as its own error code with no decline code
+// (https://docs.stripe.com/testing#declined-payments, "Incorrect number
+// decline"). Any other error code stays out, so that decline keeps Stripe's
+// own message and the ordinary retry schedule, as before.
+func declineCodeOf(errType, code, declineCode string) string {
+	if declineCode != "" {
+		return declineCode
+	}
+	if errType == string(stripe.ErrorTypeCard) && domain.IsHardDecline(code) {
+		return code
+	}
+	return ""
+}
+
 // classifyStripeError maps a stripe-go SDK error to a PaymentError. Non-Stripe
 // errors (context cancel, DNS failure wrapped by our code, etc.) are treated
 // as unknown, because we cannot prove the request never reached Stripe.
@@ -132,7 +151,7 @@ func classifyStripeError(err error) *PaymentError {
 
 	pe := &PaymentError{
 		Message:     stripeErrorMessage(err),
-		DeclineCode: string(stripeErr.DeclineCode),
+		DeclineCode: declineCodeOf(string(stripeErr.Type), string(stripeErr.Code), string(stripeErr.DeclineCode)),
 	}
 	if stripeErr.PaymentIntent != nil {
 		pe.PaymentIntentID = stripeErr.PaymentIntent.ID
@@ -377,14 +396,29 @@ func (c *LiveStripeClient) GetPaymentIntent(ctx context.Context, paymentIntentID
 	if err != nil {
 		return PaymentIntentResult{}, classifyStripeError(err)
 	}
-	return PaymentIntentResult{
+	return paymentIntentResult(pi), nil
+}
+
+// paymentIntentResult maps a retrieved PaymentIntent to what the reconciler
+// reads: status, purpose, captured amount, the charge's anchor and, for a
+// declined attempt, the bank's decline code and the card it declined
+// (last_payment_error, #966).
+func paymentIntentResult(pi *stripe.PaymentIntent) PaymentIntentResult {
+	res := PaymentIntentResult{
 		ID:                  pi.ID,
 		Status:              string(pi.Status),
 		ClientSecret:        pi.ClientSecret,
 		Purpose:             pi.Metadata["velox_purpose"],
 		AmountReceivedCents: pi.AmountReceived,
 		AnchorAt:            anchorFromPIMetadata(pi.Metadata),
-	}, nil
+	}
+	if lpe := pi.LastPaymentError; lpe != nil {
+		res.DeclineCode = declineCodeOf(string(lpe.Type), string(lpe.Code), string(lpe.DeclineCode))
+		if lpe.PaymentMethod != nil {
+			res.PaymentMethodID = lpe.PaymentMethod.ID
+		}
+	}
+	return res
 }
 
 // anchorFromPIMetadata reads the contracted simulated instant off a retrieved
